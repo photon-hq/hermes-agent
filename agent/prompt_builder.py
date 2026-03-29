@@ -256,6 +256,12 @@ PLATFORM_HINTS = {
         "only — no markdown, no formatting. SMS messages are limited to ~1600 "
         "characters, so be brief and direct."
     ),
+    "imessage": (
+        "You are on iMessage (Apple Messages). Do not use markdown — it "
+        "does not render. Keep responses conversational and mobile-friendly. "
+        "Supported actions include tapbacks, message effects, typing "
+        "indicators, and message search."
+    ),
 }
 
 CONTEXT_FILE_MAX_CHARS = 20_000

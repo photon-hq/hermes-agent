@@ -11,6 +11,7 @@ Handles loading and validating configuration for:
 import logging
 import os
 import json
+import platform as platform_mod
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any
@@ -62,6 +63,7 @@ class Platform(Enum):
     EMAIL = "email"
     SMS = "sms"
     DINGTALK = "dingtalk"
+    IMESSAGE = "imessage"
     API_SERVER = "api_server"
     WEBHOOK = "webhook"
     FEISHU = "feishu"
@@ -277,6 +279,14 @@ class GatewayConfig:
             # SMS uses api_key (Twilio auth token) — SID checked via env
             elif platform == Platform.SMS and os.getenv("TWILIO_ACCOUNT_SID"):
                 connected.append(platform)
+            # iMessage — local needs macOS; remote needs server_url + api_key
+            elif platform == Platform.IMESSAGE:
+                extra = config.extra or {}
+                is_local = _coerce_bool(extra.get("local"), True)
+                if is_local and platform_mod.system() == "Darwin":
+                    connected.append(platform)
+                elif not is_local and extra.get("server_url") and config.api_key:
+                    connected.append(platform)
             # API Server uses enabled flag only (no token needed)
             elif platform == Platform.API_SERVER:
                 connected.append(platform)
@@ -802,6 +812,28 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             chat_id=sms_home,
             name=os.getenv("SMS_HOME_CHANNEL_NAME", "Home"),
         )
+
+    # iMessage (macOS local or remote via advanced-imessage-http-proxy)
+    imessage_enabled = os.getenv("IMESSAGE_ENABLED", "").lower() in ("true", "1", "yes")
+    imessage_server = os.getenv("IMESSAGE_SERVER_URL", "")
+    imessage_key = os.getenv("IMESSAGE_API_KEY", "")
+    imessage_home = os.getenv("IMESSAGE_HOME_CHANNEL", "")
+    if imessage_enabled or imessage_server or imessage_key or imessage_home:
+        if Platform.IMESSAGE not in config.platforms:
+            config.platforms[Platform.IMESSAGE] = PlatformConfig()
+        if imessage_enabled or imessage_server:
+            config.platforms[Platform.IMESSAGE].enabled = True
+        if imessage_server:
+            config.platforms[Platform.IMESSAGE].extra["server_url"] = imessage_server
+            config.platforms[Platform.IMESSAGE].extra["local"] = False
+        if imessage_key:
+            config.platforms[Platform.IMESSAGE].api_key = imessage_key
+        if imessage_home:
+            config.platforms[Platform.IMESSAGE].home_channel = HomeChannel(
+                platform=Platform.IMESSAGE,
+                chat_id=imessage_home,
+                name="iMessage",
+            )
 
     # API Server
     api_server_enabled = os.getenv("API_SERVER_ENABLED", "").lower() in ("true", "1", "yes")

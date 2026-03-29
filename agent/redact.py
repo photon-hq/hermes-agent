@@ -146,7 +146,7 @@ def redact_sensitive_text(text: str) -> str:
     # Database connection string passwords
     text = _DB_CONNSTR_RE.sub(lambda m: f"{m.group(1)}***{m.group(3)}", text)
 
-    # E.164 phone numbers (Signal, WhatsApp)
+    # E.164 phone numbers (Signal, WhatsApp, iMessage)
     def _redact_phone(m):
         phone = m.group(1)
         if len(phone) <= 8:
