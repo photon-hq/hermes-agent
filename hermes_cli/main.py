@@ -3324,7 +3324,7 @@ For more help on a command:
     gateway_parser = subparsers.add_parser(
         "gateway",
         help="Messaging gateway management",
-        description="Manage the messaging gateway (Telegram, Discord, WhatsApp)"
+        description="Manage the messaging gateway (Telegram, Discord, WhatsApp, Signal, iMessage)"
     )
     gateway_subparsers = gateway_parser.add_subparsers(dest="gateway_command")
     
@@ -3513,7 +3513,7 @@ For more help on a command:
     cron_create.add_argument("schedule", help="Schedule like '30m', 'every 2h', or '0 9 * * *'")
     cron_create.add_argument("prompt", nargs="?", help="Optional self-contained prompt or task instruction")
     cron_create.add_argument("--name", help="Optional human-friendly job name")
-    cron_create.add_argument("--deliver", help="Delivery target: origin, local, telegram, discord, signal, or platform:chat_id")
+    cron_create.add_argument("--deliver", help="Delivery target: origin, local, telegram, discord, signal, whatsapp, imessage, or platform:chat_id")
     cron_create.add_argument("--repeat", type=int, help="Optional repeat count")
     cron_create.add_argument("--skill", dest="skills", action="append", help="Attach a skill. Repeat to add multiple skills.")
 
@@ -3645,7 +3645,7 @@ For more help on a command:
     pairing_list_parser = pairing_sub.add_parser("list", help="Show pending + approved users")
 
     pairing_approve_parser = pairing_sub.add_parser("approve", help="Approve a pairing code")
-    pairing_approve_parser.add_argument("platform", help="Platform name (telegram, discord, slack, whatsapp)")
+    pairing_approve_parser.add_argument("platform", help="Platform name (telegram, discord, slack, whatsapp, signal, imessage)")
     pairing_approve_parser.add_argument("code", help="Pairing code to approve")
 
     pairing_revoke_parser = pairing_sub.add_parser("revoke", help="Revoke user access")
@@ -4164,7 +4164,7 @@ For more help on a command:
             msgs = db.message_count()
             print(f"Total sessions: {total}")
             print(f"Total messages: {msgs}")
-            for src in ["cli", "telegram", "discord", "whatsapp", "slack"]:
+            for src in ["cli", "telegram", "discord", "whatsapp", "slack", "signal", "imessage"]:
                 c = db.session_count(source=src)
                 if c > 0:
                     print(f"  {src}: {c} sessions")

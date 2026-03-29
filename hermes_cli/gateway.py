@@ -1320,6 +1320,31 @@ _PLATFORMS = [
              "help": "The AppSecret from your DingTalk application credentials."},
         ],
     },
+    {
+        "key": "imessage",
+        "label": "iMessage",
+        "emoji": "💬",
+        "token_var": "IMESSAGE_ENABLED",
+        "setup_instructions": [
+            "Enter your Photon endpoint and API key from photon.codes.",
+            "Hermes connects to iMessage automatically via the Photon proxy.",
+            "",
+            "LOCAL MODE (macOS only, no Photon account needed):",
+            "  Leave endpoint blank, set IMESSAGE_ENABLED=true instead.",
+            "  Requires Full Disk Access (System Settings -> Privacy).",
+        ],
+        "vars": [
+            {"name": "IMESSAGE_ENABLED", "prompt": "Enable iMessage", "password": False,
+             "help": "Set to 'true' to enable iMessage.", "default": "true"},
+            {"name": "IMESSAGE_SERVER_URL", "prompt": "Photon endpoint (leave blank for local macOS mode)", "password": False,
+             "help": "e.g., https://abc123.imsgd.photon.codes"},
+            {"name": "IMESSAGE_API_KEY", "prompt": "Photon API key (leave blank for local macOS mode)", "password": True,
+             "help": "API key from photon.codes"},
+            {"name": "IMESSAGE_ALLOWED_USERS", "prompt": "Allowed phone numbers / Apple IDs (comma-separated)", "password": False,
+             "is_allowlist": True,
+             "help": "Phone numbers (e.g., +15551234567) or Apple ID emails allowed to talk to Hermes."},
+        ],
+    },
 ]
 
 
@@ -1363,6 +1388,15 @@ def _platform_status(platform: dict) -> str:
             return f"configured{suffix}"
         if val or password or homeserver:
             return "partially configured"
+        return "not configured"
+    if platform.get("key") == "imessage":
+        enabled = (val or "").lower() in ("true", "1", "yes")
+        server_url = get_env_value("IMESSAGE_SERVER_URL")
+        api_key = get_env_value("IMESSAGE_API_KEY")
+        if server_url and api_key:
+            return "configured (remote)"
+        if enabled:
+            return "configured (local)"
         return "not configured"
     if val:
         return "configured"

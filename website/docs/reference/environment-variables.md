@@ -182,6 +182,12 @@ For native Anthropic auth, Hermes prefers Claude Code's own credential files whe
 | `SMS_ALLOW_ALL_USERS` | Allow all SMS senders without an allowlist |
 | `SMS_HOME_CHANNEL` | Phone number for cron job / notification delivery |
 | `SMS_HOME_CHANNEL_NAME` | Display name for the SMS home channel |
+| `IMESSAGE_SERVER_URL` | Photon endpoint from photon.codes (e.g. `https://abc123.imsgd.photon.codes`) |
+| `IMESSAGE_API_KEY` | Photon API key from photon.codes |
+| `IMESSAGE_ENABLED` | Set to `true` for local macOS mode (no Photon account needed) |
+| `IMESSAGE_ALLOWED_USERS` | Comma-separated phone numbers or Apple ID emails |
+| `IMESSAGE_ALLOW_ALL_USERS` | Allow all iMessage senders without an allowlist |
+| `IMESSAGE_HOME_CHANNEL` | Phone number or Apple ID for cron job / notification delivery |
 | `EMAIL_ADDRESS` | Email address for the Email gateway adapter |
 | `EMAIL_PASSWORD` | Password or app password for the email account |
 | `EMAIL_IMAP_HOST` | IMAP hostname for the email adapter |
