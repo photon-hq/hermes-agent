@@ -250,3 +250,40 @@ def test_user_owned_public_health_failure_does_not_recycle_tunnel(
         )
 
     assert raised.value is failure
+
+
+def test_unowned_photon_sidecar_port_failure_prints_kill_command(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    ctx = _ctx(tmp_path, "https://example.com/photon/webhook")
+    owner = {
+        "present": True,
+        "port": 8789,
+        "command": "node",
+        "pid": "17980",
+        "user": "patrickruan",
+        "ppid": "17978",
+        "full_command": (
+            "/Users/patrickruan/.local/node/bin/node "
+            "/old/hermes/plugins/platforms/photon/sidecar/index.mjs"
+        ),
+        "hermes_home": "",
+        "photon_sidecar_port": "8789",
+        "is_photon_sidecar": True,
+    }
+
+    monkeypatch.setattr(photon_cli, "_sidecar_port", lambda: 8789)
+    monkeypatch.setattr(photon_cli, "_sidecar_port_owner", lambda _port: owner)
+
+    with pytest.raises(photon_cli._FailedInvariant) as raised:
+        photon_cli._ensure_sidecar_port_available(ctx)
+
+    failure = raised.value
+    assert failure.summary == (
+        "Photon sidecar port is already owned by an unowned Photon sidecar"
+    )
+    assert "kill 17980" in failure.repair
+    assert "kill -9 17980" in failure.repair
+    assert "lsof -nP -iTCP:8789 -sTCP:LISTEN" in failure.repair
+    assert "stop pid" not in failure.repair

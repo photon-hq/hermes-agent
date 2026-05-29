@@ -998,10 +998,7 @@ def _ensure_sidecar_port_available(ctx: _PhotonSetupContext) -> None:
             ctx,
             owner,
             summary="stale Photon sidecar from another Hermes home could not be stopped",
-            repair=(
-                f"stop pid {pid or '<unknown>'} manually, or set "
-                "PHOTON_SIDECAR_PORT to a free port, then rerun quick-setup"
-            ),
+            repair=_port_owner_repair(owner, port),
         )
 
     if (
@@ -1017,6 +1014,8 @@ def _ensure_sidecar_port_available(ctx: _PhotonSetupContext) -> None:
 
     if is_photon_sidecar and is_other_home:
         summary = "Photon sidecar port is owned by another Hermes home"
+    elif is_photon_sidecar and not owner_home:
+        summary = "Photon sidecar port is already owned by an unowned Photon sidecar"
     elif is_photon_sidecar:
         summary = "Photon sidecar port is already owned by a stale sidecar"
     else:
@@ -1025,10 +1024,7 @@ def _ensure_sidecar_port_available(ctx: _PhotonSetupContext) -> None:
         ctx,
         owner,
         summary=summary,
-        repair=(
-            f"stop pid {owner.get('pid') or '<unknown>'}, or set "
-            "PHOTON_SIDECAR_PORT to a free port, then rerun quick-setup"
-        ),
+        repair=_port_owner_repair(owner, port),
     )
 
 
@@ -1048,6 +1044,30 @@ def _sidecar_port_failure(
         observed=owner,
         evidence={"sidecar_port": port, "sidecar_bind": _DEFAULT_SIDECAR_BIND},
         repair=repair,
+    )
+
+
+def _port_owner_repair(owner: dict[str, Any], port: int) -> str:
+    pid = str(owner.get("pid") or "").strip()
+    if not pid:
+        return (
+            f"stop the process using port {port}, or set PHOTON_SIDECAR_PORT "
+            "to a free port, then rerun quick-setup"
+        )
+
+    if os.name == "nt":
+        stop_cmd = f"taskkill /PID {pid} /T"
+        force_cmd = f"taskkill /PID {pid} /T /F"
+        check_cmd = f"netstat -ano | findstr :{port}"
+    else:
+        stop_cmd = f"kill {pid}"
+        force_cmd = f"kill -9 {pid}"
+        check_cmd = f"lsof -nP -iTCP:{port} -sTCP:LISTEN"
+
+    return (
+        f"run `{stop_cmd}`, then rerun quick-setup; if the port is still "
+        f"listening, run `{force_cmd}`; check with `{check_cmd}`; or set "
+        "PHOTON_SIDECAR_PORT to a free port"
     )
 
 

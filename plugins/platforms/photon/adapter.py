@@ -59,6 +59,7 @@ from gateway.platforms.base import (
     MessageType,
     SendResult,
 )
+from hermes_constants import get_hermes_home
 
 from .auth import (
     DEFAULT_SPECTRUM_HOST,
@@ -123,6 +124,24 @@ def check_requirements() -> bool:
         # surfaces the missing-deps state in `hermes setup` / status.
         return False
     return True
+
+
+def _sidecar_process_env(
+    *,
+    project_id: str,
+    project_secret: str,
+    sidecar_port: int,
+    sidecar_bind: str,
+    sidecar_token: str,
+) -> Dict[str, str]:
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(get_hermes_home())
+    env["PHOTON_PROJECT_ID"] = project_id
+    env["PHOTON_PROJECT_SECRET"] = project_secret
+    env["PHOTON_SIDECAR_PORT"] = str(sidecar_port)
+    env["PHOTON_SIDECAR_BIND"] = sidecar_bind
+    env["PHOTON_SIDECAR_TOKEN"] = sidecar_token
+    return env
 
 
 def validate_config(cfg: PlatformConfig) -> bool:
@@ -794,12 +813,13 @@ class PhotonAdapter(BasePlatformAdapter):
                 f"cd {_SIDECAR_DIR} && npm install   "
                 "(or rerun `hermes photon quick-setup --phone '<phone>'`)"
             )
-        env = os.environ.copy()
-        env["PHOTON_PROJECT_ID"] = self._project_id
-        env["PHOTON_PROJECT_SECRET"] = self._project_secret
-        env["PHOTON_SIDECAR_PORT"] = str(self._sidecar_port)
-        env["PHOTON_SIDECAR_BIND"] = self._sidecar_bind
-        env["PHOTON_SIDECAR_TOKEN"] = self._sidecar_token
+        env = _sidecar_process_env(
+            project_id=self._project_id,
+            project_secret=self._project_secret,
+            sidecar_port=self._sidecar_port,
+            sidecar_bind=self._sidecar_bind,
+            sidecar_token=self._sidecar_token,
+        )
 
         self._sidecar_proc = subprocess.Popen(  # noqa: S603
             [self._node_bin, str(_SIDECAR_DIR / "index.mjs")],
