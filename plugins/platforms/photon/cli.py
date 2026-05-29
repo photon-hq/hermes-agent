@@ -59,6 +59,20 @@ _PHOTON_ALL_RESET_ENV_KEYS = (
     "PHOTON_HOME_CHANNEL",
     "PHOTON_HOME_CHANNEL_NAME",
 )
+_PHOTON_GATEWAY_ENV_KEYS = (
+    *_PHOTON_ALL_RESET_ENV_KEYS,
+    "PHOTON_WEBHOOK_TUNNEL_AUTOSTART",
+    "PHOTON_WEBHOOK_TUNNEL_STOP_ON_DISCONNECT",
+    "PHOTON_WEBHOOK_PORT",
+    "PHOTON_WEBHOOK_PATH",
+    "PHOTON_WEBHOOK_BIND",
+    "PHOTON_SIDECAR_PORT",
+    "PHOTON_SIDECAR_AUTOSTART",
+    "PHOTON_NODE_BIN",
+    "PHOTON_API_HOST",
+    "PHOTON_DASHBOARD_HOST",
+    "PHOTON_HOME_CHANNEL_THREAD_ID",
+)
 
 
 @dataclass
@@ -539,6 +553,7 @@ def _run_quick_setup_reconciler(ctx: _PhotonSetupContext) -> None:
         or webhook_result.secret_changed
         or webhook_result.public_url_changed
     )
+    _ensure_photon_gateway_platform_enabled(ctx)
     _ensure_gateway_local_runtime(ctx)
     identity_restarted = _reconcile_gateway_runtime_identity(
         ctx,
@@ -1265,6 +1280,65 @@ def _ensure_current_webhook_registered(
     )
 
 
+def _ensure_photon_gateway_platform_enabled(ctx: _PhotonSetupContext) -> None:
+    """Persist the explicit gateway platform bit quick-setup relies on.
+
+    The gateway has an env-driven plugin auto-enable path, but quick-setup's
+    invariant is stronger: the gateway it starts for this Hermes home must
+    load Photon.  Persisting ``platforms.photon.enabled`` makes that contract
+    independent of inherited process env and silent auto-enable skips.
+    """
+    config_path = ctx.hermes_home / "config.yaml"
+    try:
+        from utils import atomic_roundtrip_yaml_update  # type: ignore
+
+        atomic_roundtrip_yaml_update(config_path, "platforms.photon.enabled", True)
+    except Exception as e:
+        raise _failed_invariant(
+            ctx,
+            step="gateway platform config",
+            summary="could not enable Photon in gateway config",
+            expected="config.yaml contains platforms.photon.enabled=true",
+            observed=f"{type(e).__name__}: {e}",
+            evidence={"config_path": str(config_path)},
+            repair="fix config.yaml permissions or syntax, then rerun quick-setup",
+        ) from e
+
+    try:
+        from gateway.config import load_gateway_config, Platform  # type: ignore
+        from hermes_constants import (  # type: ignore
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        token = set_hermes_home_override(ctx.hermes_home)
+        try:
+            config = load_gateway_config()
+        finally:
+            reset_hermes_home_override(token)
+        platform = Platform("photon")
+        platform_cfg = config.platforms.get(platform)
+        if platform_cfg and platform_cfg.enabled:
+            return
+        observed = {
+            "platform_present": platform in config.platforms,
+            "enabled": bool(platform_cfg.enabled) if platform_cfg else False,
+            "configured_platforms": [p.value for p in config.platforms],
+        }
+    except Exception as e:
+        observed = f"{type(e).__name__}: {e}"
+
+    raise _failed_invariant(
+        ctx,
+        step="gateway platform config",
+        summary="gateway config loader did not enable Photon",
+        expected="load_gateway_config() returns platforms.photon.enabled=true",
+        observed=observed,
+        evidence={"config_path": str(config_path)},
+        repair="inspect config.yaml and plugin discovery, then rerun quick-setup",
+    )
+
+
 def _restart_current_home_gateway(ctx: _PhotonSetupContext) -> None:
     print("[gateway] Restarting current-home gateway to load updated Photon secrets...")
     service = _service_for_current_home(
@@ -1386,7 +1460,7 @@ def _launch_detached_gateway(ctx: _PhotonSetupContext) -> None:
     log_dir = ctx.hermes_home / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / "photon-quick-setup-gateway.log"
-    env = os.environ.copy()
+    env = _gateway_launch_env(ctx)
     env["HERMES_HOME"] = str(ctx.hermes_home)
     command = [
         sys.executable,
@@ -1409,6 +1483,46 @@ def _launch_detached_gateway(ctx: _PhotonSetupContext) -> None:
         )
     ctx.gateway_started = True
     print(f"  started current-home gateway process (log: {log_path})")
+
+
+def _gateway_launch_env(ctx: _PhotonSetupContext) -> dict[str, str]:
+    """Build a child env with Photon values freshly read from this home."""
+    env = os.environ.copy()
+    file_values = _read_env_file_values(ctx.env_path)
+    for key in _PHOTON_GATEWAY_ENV_KEYS:
+        if key in file_values:
+            env[key] = file_values[key]
+            continue
+        value = os.environ.get(key)
+        if value is not None:
+            env[key] = value
+    return env
+
+
+def _read_env_file_values(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    try:
+        from dotenv import dotenv_values  # type: ignore
+
+        parsed = dotenv_values(path)
+        return {
+            str(key): str(value)
+            for key, value in parsed.items()
+            if key is not None and value is not None
+        }
+    except Exception:
+        values: dict[str, str] = {}
+        try:
+            for line in path.read_text(encoding="utf-8-sig", errors="replace").splitlines():
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#") or "=" not in stripped:
+                    continue
+                key, value = stripped.split("=", 1)
+                values[key.strip()] = value.strip().strip("\"'")
+        except OSError:
+            return {}
+        return values
 
 
 def _quick_setup_log_paths(ctx: _PhotonSetupContext) -> dict[str, Path]:

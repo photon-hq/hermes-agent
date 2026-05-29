@@ -27,12 +27,23 @@ the dashboard.
 `quick-setup` is idempotent. Run it again after a reset, tunnel change,
 gateway restart, or partial setup failure.
 
-If you intentionally export a different `HERMES_HOME` for testing,
-`quick-setup` treats that exported home as the active Hermes home. An
-installed gateway service for another home is not reused or rewritten;
-Photon starts a temporary gateway for the current home when the webhook
-port is free. If another process already owns the webhook port, setup
-fails instead of guessing which home should own it.
+`quick-setup` treats the current `HERMES_HOME` as the only Hermes home it may
+mutate. That makes multi-home behavior explicit:
+
+- If the Photon active-home record already belongs to another Hermes home,
+  setup stops. Hermes does not steal ownership or delete/mutate another
+  home's webhook, tunnel, or gateway state.
+- If an installed gateway service points at another Hermes home, setup does
+  not reuse or rewrite that service. When the local ports are free, it starts
+  a temporary gateway for the current home.
+- If the webhook port or sidecar port is already owned by another process or
+  another home's gateway, setup stops and reports the owner. It does not kill
+  arbitrary processes or guess which home should win.
+- If you run setup in the default home, or in a different `HERMES_HOME` with
+  free/non-conflicting ports, setup should complete and prove local health,
+  public health, and `photon=connected`. For concurrent test homes, set
+  separate `PHOTON_WEBHOOK_PORT` and `PHOTON_SIDECAR_PORT`; otherwise only one
+  gateway can use the defaults.
 
 ### What Quick Setup Does
 
@@ -40,12 +51,12 @@ fails instead of guessing which home should own it.
 |------|----------------------------|
 | 1. Login | Validates the Photon dashboard token, or runs device login. |
 | 2. Project | Adopts or creates a Spectrum+iMessage project and stores `PHOTON_PROJECT_ID` / `PHOTON_PROJECT_SECRET`. |
-| 3. Home owner | Makes sure this `HERMES_HOME` owns the Photon runtime state. |
+| 3. Home owner | Stops if another Hermes home owns the Photon runtime state; otherwise records this `HERMES_HOME` as owner. |
 | 4. Phone user | Creates or verifies the shared iMessage user for `--phone`, then authorizes that sender in Hermes. |
 | 5. Sidecar | Verifies Node and installs `plugins/platforms/photon/sidecar` dependencies if needed. |
 | 6. Tunnel | Starts or reuses Cloudflare Quick Tunnel for the local webhook listener. |
 | 7. Webhook | Registers the current public `/photon/webhook` URL with Photon and saves its signing secret. |
-| 8. Gateway | Starts or restarts only the current-home Hermes gateway when runtime secrets changed. |
+| 8. Gateway | Enables `platforms.photon`, starts or restarts only the current-home Hermes gateway when runtime secrets changed, and confirms the Photon adapter connects. |
 | 9. Proof | Waits for local health, public health, and `photon=connected`. |
 
 Verbose mode streams useful logs while setup waits:
