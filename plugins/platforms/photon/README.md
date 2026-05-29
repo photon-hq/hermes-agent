@@ -45,6 +45,14 @@ mutate. That makes multi-home behavior explicit:
   separate `PHOTON_WEBHOOK_PORT` and `PHOTON_SIDECAR_PORT`; otherwise only one
   gateway can use the defaults.
 
+Current limitation: Photon runtime ownership is single-owner for the local OS
+user. One active Hermes home/agent owns one Photon project runtime at a time.
+Different `HERMES_HOME` profiles cannot concurrently use separate managed
+webhooks for the same Photon project, even if they have different personalities,
+configuration, ports, or tunnel URLs. To switch ownership, reset or clear the
+active-home claim intentionally, then run `quick-setup` from the Hermes home
+that should own the Photon project.
+
 ### What Quick Setup Does
 
 | Step | What it checks or changes |
