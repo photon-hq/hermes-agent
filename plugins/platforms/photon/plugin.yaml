@@ -10,12 +10,10 @@ description: >
   supervised Node sidecar that runs the `spectrum-ts` SDK (Photon does
   not currently expose a public HTTP send endpoint).
 
-  The plugin ships with a `hermes photon` CLI for the one-time login
-  + project + user setup, persists Spectrum credentials to
-  ``~/.hermes/auth.json`` under ``credential_pool.photon`` (token) and
-  ``credential_pool.photon_project`` (project id + secret), and exposes
-  Photon's free shared-line model so users can get started without a
-  paid plan.
+  The plugin ships with a `hermes photon` CLI for quick login + project
+  + user + sidecar + managed webhook tunnel setup, persists Photon secrets
+  to ``~/.hermes/.env``, and exposes Photon's free shared-line model so
+  users can get started without a paid plan.
 author: NousResearch
 requires_env:
   - name: PHOTON_PROJECT_ID
@@ -29,10 +27,27 @@ requires_env:
     url: "https://app.photon.codes/"
     password: true
 optional_env:
+  - name: PHOTON_DASHBOARD_TOKEN
+    description: "Photon dashboard bearer token (set by `hermes photon login`; used for project listing/creation)"
+    prompt: "Photon dashboard token"
+    url: "https://app.photon.codes/"
+    password: true
   - name: PHOTON_WEBHOOK_SECRET
     description: "Per-URL HMAC-SHA256 signing secret returned at webhook registration"
     prompt: "Photon webhook signing secret"
     password: true
+  - name: PHOTON_WEBHOOK_PUBLIC_URL
+    description: "Public Photon webhook URL registered by quick setup or webhook register"
+    prompt: "Photon webhook public URL"
+    password: false
+  - name: PHOTON_WEBHOOK_TUNNEL_AUTOSTART
+    description: "Start/register the managed Cloudflare Quick Tunnel when the gateway connects (default true)"
+    prompt: "Auto-start managed webhook tunnel?"
+    password: false
+  - name: PHOTON_WEBHOOK_TUNNEL_STOP_ON_DISCONNECT
+    description: "Stop a gateway-started managed tunnel when the gateway stops (default true)"
+    prompt: "Stop managed tunnel with gateway?"
+    password: false
   - name: PHOTON_WEBHOOK_PORT
     description: "Local port the webhook receiver listens on (default 8788)"
     prompt: "Webhook receiver port"
@@ -66,7 +81,7 @@ optional_env:
     prompt: "Dashboard host"
     password: false
   - name: PHOTON_ALLOWED_USERS
-    description: "Comma-separated E.164 phone numbers allowed to talk to the bot"
+    description: "Comma-separated E.164 phone numbers allowed to talk to the bot; setup seeds --phone"
     prompt: "Allowed users (comma-separated)"
     password: false
   - name: PHOTON_ALLOW_ALL_USERS
