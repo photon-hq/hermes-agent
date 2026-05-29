@@ -217,9 +217,13 @@ hermes photon webhook tunnel stop
 Common public-health failures:
 
 - `HTTP 502`: Cloudflare reached the tunnel before the gateway was ready.
-- `system DNS failed` or `HTTP 530`: this Mac cannot resolve the current
-  Quick Tunnel hostname. Wait 30-60 seconds and rerun setup; if it
-  repeats, stop and start the managed tunnel to get a fresh hostname:
+- `explicit DNS fallback via ...`: the macOS system resolver did not resolve
+  the Quick Tunnel hostname, but Hermes verified the same URL with an
+  explicit DNS result. This is acceptable for local setup; do not churn the
+  tunnel just for this status.
+- `system DNS failed` or `HTTP 530`: this Mac still cannot verify the current
+  Quick Tunnel hostname. Check DNS/network settings and rerun setup. Stop and
+  start the managed tunnel only when you intentionally want a fresh URL:
   `hermes photon webhook tunnel stop && hermes photon webhook tunnel start`.
 - Extra stale managed webhooks: cleanup noise unless the current URL is
   missing or unregistered.

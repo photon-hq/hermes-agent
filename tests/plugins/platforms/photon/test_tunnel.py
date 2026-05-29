@@ -70,6 +70,111 @@ def test_start_ignores_old_log_urls(
     assert saved["public_url"] == new_url
 
 
+def test_start_force_new_stops_existing_tunnel(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    state_dir = tmp_path / "photon"
+    state_dir.mkdir()
+    state_path = state_dir / "tunnel.json"
+    log_path = state_dir / "cloudflared.log"
+    new_url = "https://new-one.trycloudflare.com"
+    status_calls = [
+        {"running": True, "pid": 111, "public_url": "https://old.trycloudflare.com"},
+        {"running": False, "pid": None, "public_url": ""},
+        {"running": False, "pid": None, "public_url": ""},
+    ]
+    stop_calls = []
+
+    monkeypatch.setattr(photon_tunnel, "state_dir", lambda: state_dir)
+    monkeypatch.setattr(photon_tunnel, "state_path", lambda: state_path)
+    monkeypatch.setattr(photon_tunnel, "log_path", lambda: log_path)
+    monkeypatch.setattr(
+        photon_tunnel,
+        "status",
+        lambda: status_calls.pop(0) if status_calls else {"running": False},
+    )
+    monkeypatch.setattr(
+        photon_tunnel,
+        "stop",
+        lambda: stop_calls.append(True) or {"stopped": True, "message": "stopped"},
+    )
+    monkeypatch.setattr(
+        photon_tunnel,
+        "resolve_cloudflared_binary",
+        lambda **_kwargs: "/bin/cloudflared",
+    )
+
+    class FakeProc:
+        pid = 222
+        returncode = None
+
+        def poll(self) -> None:
+            return None
+
+    def fake_popen(*_args: Any, **kwargs: Any) -> FakeProc:
+        stdout = kwargs["stdout"]
+        stdout.write(f"|  {new_url}  |\n")
+        stdout.flush()
+        return FakeProc()
+
+    monkeypatch.setattr(photon_tunnel.subprocess, "Popen", fake_popen)
+
+    result = photon_tunnel.start(
+        timeout_seconds=0.5,
+        auto_install=False,
+        force_new=True,
+    )
+
+    assert stop_calls == [True]
+    assert result.success is True
+    assert result.reused is False
+    assert result.public_url == new_url
+
+
+def test_public_health_uses_explicit_dns_fallback(
+    monkeypatch: Any,
+) -> None:
+    url = "https://fresh.trycloudflare.com/photon/webhook"
+
+    def fake_urlopen(*_args: Any, **_kwargs: Any) -> None:
+        raise urllib.error.URLError(
+            socket.gaierror(8, "nodename nor servname provided, or not known")
+        )
+
+    def fake_which(name: str) -> str:
+        return f"/usr/bin/{name}"
+
+    def fake_run(command: list[str], **_kwargs: Any) -> Any:
+        tool = Path(command[0]).name
+        if tool == "dig":
+            return photon_tunnel.subprocess.CompletedProcess(
+                command,
+                0,
+                stdout="104.16.230.132\n",
+                stderr="",
+            )
+        if tool == "curl":
+            assert "--resolve" in command
+            assert "fresh.trycloudflare.com:443:104.16.230.132" in command
+            return photon_tunnel.subprocess.CompletedProcess(
+                command,
+                0,
+                stdout="ok",
+                stderr="",
+            )
+        raise AssertionError(command)
+
+    monkeypatch.setattr(photon_tunnel.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(photon_tunnel.shutil, "which", fake_which)
+    monkeypatch.setattr(photon_tunnel.subprocess, "run", fake_run)
+
+    ok, detail = photon_tunnel.check_public_health(url)
+
+    assert ok is True
+    assert "explicit DNS fallback via 104.16.230.132" in detail
+
+
 def test_public_health_classifies_system_dns_failure(
     monkeypatch: Any,
 ) -> None:
@@ -81,6 +186,11 @@ def test_public_health_classifies_system_dns_failure(
         )
 
     monkeypatch.setattr(photon_tunnel.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(
+        photon_tunnel,
+        "_check_public_health_with_explicit_dns",
+        lambda *_args, **_kwargs: (False, ""),
+    )
 
     ok, detail = photon_tunnel.check_public_health(url)
 
@@ -97,6 +207,11 @@ def test_public_health_classifies_curl_style_dns_failure(
         raise urllib.error.URLError("could not resolve host")
 
     monkeypatch.setattr(photon_tunnel.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(
+        photon_tunnel,
+        "_check_public_health_with_explicit_dns",
+        lambda *_args, **_kwargs: (False, ""),
+    )
 
     ok, detail = photon_tunnel.check_public_health(
         "https://fresh.trycloudflare.com/photon/webhook"

@@ -545,15 +545,18 @@ def _run_quick_setup_reconciler(ctx: _PhotonSetupContext) -> None:
     _ensure_sidecar_port_available(ctx)
     _ensure_public_webhook_path(ctx, wait_for_health=False)
     webhook_result = _ensure_current_webhook_registered(ctx)
-    ctx.registered_hooks = webhook_result.hooks
-    ctx.runtime_secrets_changed = (
-        ctx.runtime_secrets_changed
-        or webhook_result.secret_changed
-        or webhook_result.public_url_changed
-    )
+    _record_webhook_runtime_changes(ctx, webhook_result)
     _ensure_photon_gateway_platform_enabled(ctx)
+    _restart_gateway_if_runtime_secrets_changed(
+        ctx,
+        reason="Photon webhook state changed",
+    )
     _ensure_gateway_local_runtime(ctx)
-    _wait_for_public_health(ctx, reason="post-webhook verification")
+    ctx.runtime_secrets_changed = False
+    _wait_for_public_health_with_managed_repair(
+        ctx,
+        reason="post-webhook verification",
+    )
     _wait_for_photon_connected(ctx)
 
 
@@ -1246,6 +1249,18 @@ def _ensure_current_webhook_registered(
     )
 
 
+def _record_webhook_runtime_changes(
+    ctx: _PhotonSetupContext,
+    result: _WebhookEnsureResult,
+) -> None:
+    ctx.registered_hooks = result.hooks
+    ctx.runtime_secrets_changed = (
+        ctx.runtime_secrets_changed
+        or result.secret_changed
+        or result.public_url_changed
+    )
+
+
 def _ensure_photon_gateway_platform_enabled(ctx: _PhotonSetupContext) -> None:
     """Persist the explicit gateway platform bit quick-setup relies on.
 
@@ -1334,6 +1349,24 @@ def _restart_current_home_gateway(ctx: _PhotonSetupContext) -> None:
             evidence={"service": service, "runtime": _inspect_gateway_runtime()},
             repair="repair the current-home gateway service, then rerun quick-setup",
         ) from e
+
+
+def _restart_gateway_if_runtime_secrets_changed(
+    ctx: _PhotonSetupContext,
+    *,
+    reason: str,
+) -> None:
+    if not ctx.runtime_secrets_changed:
+        return
+    runtime = _inspect_gateway_runtime()
+    if not runtime.get("running"):
+        return
+    _restart_current_home_gateway(ctx)
+    _wait_for_local_health(
+        ctx,
+        reason=f"gateway restart after {reason}",
+    )
+    ctx.runtime_secrets_changed = False
 
 
 def _wait_for_photon_connected(ctx: _PhotonSetupContext, timeout_seconds: float = 60.0) -> None:
@@ -1754,6 +1787,77 @@ def _wait_for_public_health(
             "managed_tunnel": photon_tunnel.status(),
         },
         repair="restart the managed tunnel or repair the user-owned public URL, then rerun quick-setup",
+    )
+
+
+def _wait_for_public_health_with_managed_repair(
+    ctx: _PhotonSetupContext,
+    *,
+    reason: str,
+) -> None:
+    try:
+        _wait_for_public_health(ctx, reason=reason)
+        return
+    except _FailedInvariant as exc:
+        if not _should_recycle_managed_tunnel(ctx, exc):
+            raise
+        print("  public managed tunnel health failed; recycling Quick Tunnel once")
+
+    _recycle_managed_tunnel_and_retry_public_health(ctx, reason=reason)
+
+
+def _should_recycle_managed_tunnel(
+    ctx: _PhotonSetupContext,
+    failure: _FailedInvariant,
+) -> bool:
+    if failure.step != "public webhook health":
+        return False
+    if not photon_tunnel.is_trycloudflare_url(ctx.webhook_url):
+        return False
+    local = ctx.local_health or _check_local_health(ctx)
+    ctx.local_health = local
+    return bool(local.ok)
+
+
+def _recycle_managed_tunnel_and_retry_public_health(
+    ctx: _PhotonSetupContext,
+    *,
+    reason: str,
+) -> None:
+    result = photon_tunnel.start(force_new=True, on_install=print)
+    if not result.success:
+        raise _failed_invariant(
+            ctx,
+            step="managed tunnel",
+            summary="Cloudflare Quick Tunnel could not be recycled",
+            expected="managed tunnel stops and publishes a fresh trycloudflare.com URL",
+            observed=result.error or "unknown cloudflared failure",
+            evidence={
+                "reason": reason,
+                "previous_webhook_url": ctx.webhook_url,
+                "cloudflared_log": str(result.log_path) if result.log_path else "",
+                "command": result.command,
+                "local_health": _health_evidence(ctx.local_health),
+            },
+            repair="stop the managed tunnel manually, then rerun quick-setup",
+        )
+
+    previous_url = ctx.webhook_url
+    ctx.webhook_url = result.webhook_url
+    ctx.public_health = None
+    print(f"  ✓ refreshed managed tunnel: {result.webhook_url}")
+
+    webhook_result = _ensure_current_webhook_registered(ctx)
+    _record_webhook_runtime_changes(ctx, webhook_result)
+    _restart_gateway_if_runtime_secrets_changed(
+        ctx,
+        reason="managed tunnel URL changed",
+    )
+    _ensure_gateway_local_runtime(ctx)
+    ctx.runtime_secrets_changed = False
+    _wait_for_public_health(
+        ctx,
+        reason=f"{reason}; refreshed managed tunnel from {previous_url}",
     )
 
 

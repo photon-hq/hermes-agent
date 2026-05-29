@@ -25,6 +25,7 @@ DEFAULT_WEBHOOK_PATH = "/photon/webhook"
 DEFAULT_START_TIMEOUT_SECONDS = 30.0
 CLOUDFLARED_RELEASE_API = "https://api.github.com/repos/cloudflare/cloudflared/releases/latest"
 _TRYCLOUDFLARE_RE = re.compile(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com")
+_IPV4_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
 
 
 @dataclass
@@ -217,8 +218,80 @@ def check_public_health(webhook_url: str, timeout_seconds: float = 5.0) -> tuple
     except Exception as e:
         detail = f"{health_url} failed: {e}"
         if _looks_like_dns_resolution_failure(e):
+            fallback_ok, fallback_detail = _check_public_health_with_explicit_dns(
+                health_url,
+                timeout_seconds=timeout_seconds,
+            )
+            if fallback_ok:
+                return True, fallback_detail
+            if fallback_detail:
+                detail = f"{detail}; {fallback_detail}"
             return False, f"{detail}; {_system_dns_failure_detail(health_url)}"
         return False, detail
+
+
+def _check_public_health_with_explicit_dns(
+    health_url: str,
+    *,
+    timeout_seconds: float,
+) -> tuple[bool, str]:
+    parsed = urlparse(health_url)
+    host = parsed.hostname or ""
+    if not host or parsed.scheme != "https" or not is_trycloudflare_url(health_url):
+        return False, ""
+    ip = _resolve_a_record_with_dig(host)
+    if not ip:
+        return False, "explicit DNS fallback could not resolve an A record"
+    curl = shutil.which("curl")
+    if not curl:
+        return False, "explicit DNS fallback unavailable: curl not found"
+    port = parsed.port or 443
+    try:
+        result = subprocess.run(  # noqa: S603
+            [
+                curl,
+                "-fsS",
+                "-m",
+                f"{timeout_seconds:.1f}",
+                "--resolve",
+                f"{host}:{port}:{ip}",
+                health_url,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds + 2,
+            check=False,
+        )
+    except Exception as e:
+        return False, f"explicit DNS fallback failed: {type(e).__name__}: {e}"
+    body = (result.stdout or "").strip()
+    if result.returncode == 0 and body == "ok":
+        return True, f"{health_url} (explicit DNS fallback via {ip})"
+    detail = (result.stderr or body or f"curl exited {result.returncode}").strip()
+    return False, f"explicit DNS fallback failed: {detail}"
+
+
+def _resolve_a_record_with_dig(host: str) -> str:
+    dig = shutil.which("dig")
+    if not dig:
+        return ""
+    try:
+        result = subprocess.run(  # noqa: S603
+            [dig, "+short", host, "A"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except Exception:
+        return ""
+    if result.returncode != 0:
+        return ""
+    for line in (result.stdout or "").splitlines():
+        value = line.strip()
+        if _IPV4_RE.match(value):
+            return value
+    return ""
 
 
 def _looks_like_dns_resolution_failure(exc: BaseException) -> bool:
@@ -690,9 +763,30 @@ def start(
     *,
     auto_install: bool = True,
     on_install: Optional[Any] = None,
+    force_new: bool = False,
 ) -> TunnelStartResult:
+    if force_new:
+        current = status()
+        if current.get("running"):
+            stop_result = stop()
+            after_stop = status()
+            if after_stop.get("running"):
+                return TunnelStartResult(
+                    success=False,
+                    error=(
+                        "could not stop existing managed tunnel: "
+                        f"{stop_result.get('message') or 'still running'}"
+                    ),
+                    pid=int(after_stop["pid"]) if after_stop.get("pid") else None,
+                    log_path=log_path(),
+                )
+
     current = status()
-    if current.get("running") and is_trycloudflare_url(str(current.get("public_url") or "")):
+    if (
+        not force_new
+        and current.get("running")
+        and is_trycloudflare_url(str(current.get("public_url") or ""))
+    ):
         public_url = str(current.get("public_url") or "")
         webhook_url = str(current.get("webhook_url") or "") or webhook_url_for_base(public_url)
         return TunnelStartResult(

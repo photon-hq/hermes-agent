@@ -302,10 +302,15 @@ Common issues:
   Cloudflare reached the tunnel before the local gateway was ready.
   `hermes photon status` checks local health and service identity before
   suggesting a repair.
+- **`public health : ✓ reachable (... explicit DNS fallback via ...)`** —
+  the macOS system resolver did not resolve the Quick Tunnel hostname, but
+  Hermes verified the same URL with an explicit DNS result. This is OK for
+  local setup; do not restart the tunnel just for this status.
 - **`public health : ✗ unreachable (... system DNS failed to resolve ...)`
   or `HTTP Error 530`** — this Mac cannot resolve the current Quick
-  Tunnel hostname. Wait 30-60 seconds and rerun setup; if it repeats,
-  run `hermes photon webhook tunnel stop && hermes photon webhook tunnel start`.
+  Tunnel hostname even after fallback verification. Check DNS/network
+  settings and rerun setup. Stop and start the managed tunnel only when
+  you intentionally want a fresh URL.
 - **`registered webhooks : ... unowned stale managed`** — old managed
   URLs are visible in Photon but are not the first thing to fix when
   the current URL is registered. Public health and gateway connection
