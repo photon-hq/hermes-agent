@@ -127,7 +127,7 @@ def test_managed_public_health_failure_recycles_tunnel_once(
     ]
 
 
-def test_managed_dns_failure_does_not_recycle_tunnel(
+def test_managed_dns_failure_recycles_tunnel_once(
     tmp_path: Path,
     monkeypatch: Any,
 ) -> None:
@@ -139,29 +139,80 @@ def test_managed_dns_failure_does_not_recycle_tunnel(
         status=200,
     )
     failure = _public_health_failure(ctx, step="public webhook DNS")
+    wait_calls: list[str] = []
+    restart_calls: list[bool] = []
+    ensure_gateway_calls: list[str] = []
+    webhook_calls: list[str] = []
 
     def fake_wait_public_health(
-        _call_ctx: photon_cli._PhotonSetupContext,
+        call_ctx: photon_cli._PhotonSetupContext,
         *,
         reason: str,
     ) -> None:
-        assert reason == "post-webhook verification"
-        raise failure
+        wait_calls.append(reason)
+        if len(wait_calls) == 1:
+            raise failure
+        call_ctx.public_health = (True, "ok")
 
-    monkeypatch.setattr(photon_cli, "_wait_for_public_health", fake_wait_public_health)
-    monkeypatch.setattr(
-        photon_cli.photon_tunnel,
-        "start",
-        lambda **_kwargs: pytest.fail("DNS failures must not recycle managed tunnels"),
-    )
-
-    with pytest.raises(photon_cli._FailedInvariant) as raised:
-        photon_cli._wait_for_public_health_with_managed_repair(
-            ctx,
-            reason="post-webhook verification",
+    def fake_start(**kwargs: Any) -> photon_cli.photon_tunnel.TunnelStartResult:
+        assert kwargs["force_new"] is True
+        return photon_cli.photon_tunnel.TunnelStartResult(
+            success=True,
+            public_url="https://new.trycloudflare.com",
+            webhook_url="https://new.trycloudflare.com/photon/webhook",
         )
 
-    assert raised.value is failure
+    def fake_webhook_register(
+        call_ctx: photon_cli._PhotonSetupContext,
+    ) -> photon_cli._WebhookEnsureResult:
+        webhook_calls.append(call_ctx.webhook_url)
+        return photon_cli._WebhookEnsureResult(
+            hooks=[{"id": "new"}],
+            registered=True,
+            secret_changed=False,
+            public_url_changed=True,
+        )
+
+    def fake_restart_if_changed(
+        call_ctx: photon_cli._PhotonSetupContext,
+        *,
+        reason: str,
+    ) -> None:
+        restart_calls.append(call_ctx.runtime_secrets_changed)
+        assert reason == "managed tunnel URL changed"
+        call_ctx.runtime_secrets_changed = False
+
+    monkeypatch.setattr(photon_cli, "_wait_for_public_health", fake_wait_public_health)
+    monkeypatch.setattr(photon_cli.photon_tunnel, "start", fake_start)
+    monkeypatch.setattr(photon_cli, "_ensure_current_webhook_registered", fake_webhook_register)
+    monkeypatch.setattr(
+        photon_cli,
+        "_restart_gateway_if_runtime_secrets_changed",
+        fake_restart_if_changed,
+    )
+    monkeypatch.setattr(
+        photon_cli,
+        "_ensure_gateway_local_runtime",
+        lambda call_ctx: ensure_gateway_calls.append(call_ctx.webhook_url),
+    )
+
+    photon_cli._wait_for_public_health_with_managed_repair(
+        ctx,
+        reason="post-webhook verification",
+    )
+
+    assert ctx.webhook_url == "https://new.trycloudflare.com/photon/webhook"
+    assert ctx.public_health == (True, "ok")
+    assert webhook_calls == ["https://new.trycloudflare.com/photon/webhook"]
+    assert restart_calls == [True]
+    assert ensure_gateway_calls == ["https://new.trycloudflare.com/photon/webhook"]
+    assert wait_calls == [
+        "post-webhook verification",
+        (
+            "post-webhook verification; refreshed managed tunnel from "
+            "https://old.trycloudflare.com/photon/webhook"
+        ),
+    ]
 
 
 def test_user_owned_public_health_failure_does_not_recycle_tunnel(

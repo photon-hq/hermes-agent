@@ -1810,7 +1810,7 @@ def _should_recycle_managed_tunnel(
     ctx: _PhotonSetupContext,
     failure: _FailedInvariant,
 ) -> bool:
-    if failure.step != "public webhook health":
+    if failure.step not in {"public webhook health", "public webhook DNS"}:
         return False
     if not photon_tunnel.is_trycloudflare_url(ctx.webhook_url):
         return False
