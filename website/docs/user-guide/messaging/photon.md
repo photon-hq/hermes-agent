@@ -56,40 +56,52 @@ when it needs to resolve an uncached outbound space.
 ## First-time setup
 
 ```bash
-# Device-code login first. Quick setup intentionally requires this
-# to be completed before it creates the user or webhook.
-hermes photon login
-
-# Project + user + sidecar deps + webhook tunnel.
+# Set up Photon on this machine.
 # Replace the placeholder with your E.164 number:
 # + followed by country code and number, no spaces.
 hermes photon quick-setup --phone '+<country-code><number>'
+```
 
-# Check the computed next step whenever you get stuck.
+`quick-setup` is a reconciler. It:
+
+1. Validates the Photon dashboard login, or runs device login when needed
+2. Validates local Spectrum credentials before reuse
+3. Reuses local project credentials, adopts one matching Photon project
+   named `Hermes Agent`, or creates one when none exists
+4. Calls the Spectrum `create-user` endpoint with `type: shared` so
+   Photon allocates an iMessage line from the free pool
+5. Adds the same `--phone` value to `PHOTON_ALLOWED_USERS` as the
+   initial Hermes/Photon operator
+6. Runs `npm install` inside the plugin's sidecar directory
+7. Starts or reuses the gateway for the same Hermes home
+8. Proves local `/healthz`
+9. Starts or verifies the public webhook URL
+10. Registers the current webhook and saves its signing secret
+11. Restarts only the current-home gateway if runtime secrets changed
+12. Waits until gateway runtime reports `photon=connected`
+
+On success, Hermes prints the assigned iMessage number when Photon
+returns one and a compact health summary. On failure, it prints the
+specific invariant that failed with evidence such as Hermes home, env
+path, service home, port owner, local health, public health, webhook
+state, project id, and the last relevant gateway/Photon log lines.
+
+For live diagnostics while setup waits for the gateway, tunnel, and
+runtime status, use verbose mode:
+
+```bash
+hermes photon quick-setup -v --phone '+<country-code><number>'
+```
+
+Advanced/debug commands remain available:
+
+```bash
+hermes photon login
 hermes photon status
 ```
 
-The wizard:
-
-1. Verifies that `hermes photon login` has already completed
-2. Reuses local project credentials, adopts one matching Photon project
-   named `Hermes Agent`, or creates one when none exists
-3. Calls the Spectrum `create-user` endpoint with `type: shared` so
-   Photon allocates an iMessage line from the free pool
-4. Adds the same `--phone` value to `PHOTON_ALLOWED_USERS` as the
-   initial Hermes/Photon operator
-5. Runs `npm install` inside the plugin's sidecar directory
-6. Starts a local Cloudflare Quick Tunnel and registers the public
-   `trycloudflare.com` webhook URL with Photon
-
-Important: quick setup does not start the Hermes gateway. It prepares
-Photon, the tunnel, and the local credentials, but iMessage replies only
-work while `hermes gateway run -v` is running in a terminal or the
-gateway service is installed and started. If you used a custom
-`HERMES_HOME`, export the same value before starting the gateway. When
-the Photon adapter starts, it verifies the managed tunnel registration
-for that same profile and cleans stale managed `trycloudflare.com`
-webhooks.
+Quick setup uses a local Cloudflare Quick Tunnel by default and registers
+the public `trycloudflare.com` webhook URL with Photon.
 
 `hermes setup gateway` runs the same guided Photon setup when you choose
 Photon. Running setup again is safe: Hermes will not silently duplicate
@@ -164,7 +176,10 @@ the current managed webhook registration.
 If the managed `cloudflared` install fails, Hermes prints manual install
 instructions and the `hermes photon webhook register ...` fallback.
 
-## Start the gateway
+## Manual gateway runtime
+
+`quick-setup` starts or reuses a gateway for the same Hermes home before
+it returns success. For foreground debugging, run:
 
 ```bash
 hermes gateway run -v
@@ -197,11 +212,12 @@ hermes gateway start
 ## Detailed commands
 
 ```bash
-# One-command setup.
-hermes photon login
+# First-run setup.
 hermes photon quick-setup --phone '+<country-code><number>'
+hermes photon quick-setup -v --phone '+<country-code><number>'
 
 # Separate setup steps for debugging or advanced installs.
+hermes photon login
 hermes photon projects list
 hermes photon projects select <dashboard-or-spectrum-project-id>
 hermes photon setup --phone '+<country-code><number>'
@@ -224,13 +240,6 @@ hermes gateway run -v
 hermes gateway restart
 ```
 
-For always-on local use, install the launchd service and start it:
-
-```bash
-hermes gateway install --force
-hermes gateway start
-```
-
 ## Status & troubleshooting
 
 ```bash
@@ -245,12 +254,23 @@ Photon iMessage status
   device token        : ✓ stored
   project id          : 3c90c3cc-0d44-4b50-...
   project key         : ✓ stored
+  webhook key         : ✓ set
+  Hermes home         : /Users/you/.hermes
+  env path            : /Users/you/.hermes/.env
+  dashboard auth      : ✓ valid
+  Spectrum creds      : ✓ valid
+  Photon owner        : this Hermes home
+  gateway service     : launchd installed; running; home=/Users/you/.hermes
+  gateway runtime     : pid 12345; photon=connected
+  local health        : ✓ reachable (http://127.0.0.1:8788/healthz)
   node binary         : /usr/bin/node
   sidecar deps        : ✓ installed
-  webhook key         : ✓ set
+  authorized phones   : 1 configured
   webhook public URL  : https://...
+  registered webhooks : ✓ 1 registered; current URL registered
   managed tunnel      : ✓ running (pid 12345)
-  next step           : hermes gateway run -v  (or `hermes gateway restart` if already running)
+  public health       : ✓ reachable (https://.../healthz)
+  next step           : gateway is running; send an iMessage to the Photon number
   docs                : plugins/platforms/photon/README.md; website/docs/user-guide/messaging/photon.md
 ```
 
@@ -265,6 +285,22 @@ Common issues:
 - **`managed tunnel : ✗ stopped`** — run
   `hermes photon webhook tunnel start`. Quick Tunnel URLs can change
   after restart, so Hermes will update the registered Photon webhook.
+- **`public health : ✗ unreachable (... HTTP Error 502: Bad Gateway)`** —
+  Cloudflare reached the tunnel before the local gateway was ready.
+  `hermes photon status` checks local health and service identity before
+  suggesting a repair.
+- **`public health : ✗ unreachable (... nodename nor servname provided ...)`
+  or `HTTP Error 530`** — the saved Quick Tunnel hostname is not usable.
+  Run `hermes photon webhook tunnel stop && hermes photon webhook tunnel start`.
+- **`registered webhooks : ... unowned stale managed`** — old managed
+  URLs are visible in Photon but are not the first thing to fix when
+  the current URL is registered. Public health and gateway connection
+  are the blocking checks; delete old webhook IDs manually later with
+  `hermes photon webhook list` if needed.
+- **`gateway runtime project identity` failed** — quick setup validated
+  one Photon project, but the running gateway loaded a different
+  `PHOTON_PROJECT_ID`. Restart the current-home gateway so it reloads
+  the reconciled `.env`, then rerun quick setup.
 - **`PHOTON_WEBHOOK_PORT` already in use** — set a different port via
   `~/.hermes/.env`.
 - **Webhook reachable from localhost but Photon can't deliver** —

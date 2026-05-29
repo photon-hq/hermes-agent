@@ -358,6 +358,25 @@ class TestGatewayRuntimeStatus:
         assert payload["platforms"]["discord"]["error_code"] is None
         assert payload["platforms"]["discord"]["error_message"] is None
 
+    def test_write_runtime_status_records_platform_metadata(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        status.write_runtime_status(
+            platform="photon",
+            platform_state="connected",
+            platform_metadata={
+                "project_id": "5123d23c-8642-44e4-acf1-66695c1b8171",
+                "webhook_port": 8788,
+            },
+        )
+
+        payload = status.read_runtime_status()
+        assert (
+            payload["platforms"]["photon"]["project_id"]
+            == "5123d23c-8642-44e4-acf1-66695c1b8171"
+        )
+        assert payload["platforms"]["photon"]["webhook_port"] == 8788
+
 
 class TestTerminatePid:
     def test_force_uses_taskkill_on_windows(self, monkeypatch):

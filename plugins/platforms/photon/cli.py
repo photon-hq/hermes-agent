@@ -5,10 +5,10 @@
 Subcommands:
 
     login              run the device-code OAuth flow
-    quick-setup        guided setup + managed webhook tunnel registration
+    quick-setup        reconcile Photon setup and prove runtime readiness
     setup              full first-time setup (login + project + user + sidecar)
     allow-phone        authorize another E.164 sender for Photon gateway use
-    status             show login + project + sidecar dep state
+    status             show Photon setup/runtime invariant state
     install-sidecar    npm install inside plugins/platforms/photon/sidecar/
     webhook register   register the local webhook URL with Photon
     webhook list       list registered webhooks
@@ -22,14 +22,18 @@ import argparse
 import getpass
 import json
 import os
+import plistlib
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
+import urllib.error
+import urllib.request
 
 from . import auth as photon_auth
 from . import tunnel as photon_tunnel
@@ -52,6 +56,86 @@ class _SetupOutcome:
         return self
 
 
+@dataclass
+class _HealthResult:
+    ok: bool
+    url: str
+    detail: str
+    status: Optional[int] = None
+
+
+@dataclass
+class _WebhookEnsureResult:
+    hooks: list
+    registered: bool
+    secret_changed: bool = False
+    public_url_changed: bool = False
+
+
+@dataclass
+class _PhotonSetupContext:
+    args: argparse.Namespace
+    hermes_home: Path
+    env_path: Path
+    project_name: str
+    webhook_port: int
+    webhook_path: str
+    project_id: str = ""
+    project_secret: str = ""
+    operator_phone: Optional[str] = None
+    assigned_phone_number: Optional[str] = None
+    webhook_url: str = ""
+    registered_hooks: Optional[list] = None
+    runtime_secrets_changed: bool = False
+    gateway_started: bool = False
+    local_health: Optional[_HealthResult] = None
+    public_health: Optional[tuple[bool, str]] = None
+    verbose: bool = False
+    log_offsets: dict[str, int] = field(default_factory=dict)
+
+    @classmethod
+    def from_args(cls, args: argparse.Namespace) -> "_PhotonSetupContext":
+        hermes_home = photon_tunnel.hermes_home()
+        return cls(
+            args=args,
+            hermes_home=hermes_home,
+            env_path=photon_auth._env_path(),
+            project_name=_setup_project_name(args),
+            webhook_port=photon_tunnel.webhook_port(),
+            webhook_path=photon_tunnel.webhook_path(),
+            verbose=bool(getattr(args, "verbose", False)),
+        )
+
+    def outcome(self) -> _SetupOutcome:
+        return _SetupOutcome(
+            project_name=self.project_name,
+            operator_phone=self.operator_phone,
+            assigned_phone_number=self.assigned_phone_number,
+        )
+
+
+class _FailedInvariant(RuntimeError):
+    def __init__(
+        self,
+        *,
+        step: str,
+        summary: str,
+        expected: str,
+        observed: Any,
+        evidence: dict[str, Any],
+        repair: str,
+        logs: Optional[dict[str, list[str]]] = None,
+    ) -> None:
+        super().__init__(summary)
+        self.step = step
+        self.summary = summary
+        self.expected = expected
+        self.observed = observed
+        self.evidence = evidence
+        self.repair = repair
+        self.logs = logs or {}
+
+
 # ---------------------------------------------------------------------------
 # argparse wiring
 
@@ -67,7 +151,7 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
 
     p_quick = subs.add_parser(
         "quick-setup",
-        help="Guided setup with managed Cloudflare webhook tunnel",
+        help="Reconcile Photon setup and prove runtime readiness",
     )
     p_quick.add_argument("--project-name", default=None, help="Project name (default: 'Hermes Agent')")
     p_quick.add_argument("--phone", default=None, help=f"Your E.164 phone number (format: {_PHONE_FORMAT})")
@@ -79,6 +163,8 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
                          help="Create a new Photon dashboard project instead of adopting an existing one")
     p_quick.add_argument("--skip-sidecar-install", action="store_true",
                          help="Skip `npm install` inside the sidecar directory")
+    p_quick.add_argument("-v", "--verbose", action="store_true",
+                         help="Stream existing gateway/Photon logs while setup waits")
 
     p_setup = subs.add_parser("setup", help="First-time setup (login + project + user + sidecar)")
     p_setup.add_argument("--project-name", default=None, help="Project name (default: 'Hermes Agent')")
@@ -98,7 +184,7 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     )
     p_allow.add_argument("phone", help=f"E.164 phone number (format: {_PHONE_FORMAT})")
 
-    subs.add_parser("status", help="Show login + project + sidecar dep state")
+    subs.add_parser("status", help="Show Photon setup/runtime invariant state")
     subs.add_parser("diagnose-auth", help="Print sanitized Photon auth diagnostics")
     subs.add_parser("install-sidecar", help="Run npm install inside the sidecar directory")
 
@@ -203,29 +289,1415 @@ def _cmd_login(args: argparse.Namespace) -> int:
 
 
 def _cmd_quick_setup(args: argparse.Namespace) -> int:
-    project_id, project_secret = photon_auth.load_project_credentials()
-    if (
-        not photon_auth.load_photon_token()
-        and not (project_id and project_secret)
-    ):
-        print_login_first_guidance()
-        return 1
-
-    setattr(args, "auto_create_project", True)
     print("Photon quick setup")
     print("──────────────────")
-    outcome = _run_base_setup(args, total_steps=5)
-    if outcome.returncode != 0:
-        return outcome.returncode
 
-    print("[5/5] Starting Cloudflare Quick Tunnel and registering webhook...")
-    rc = _start_managed_tunnel_and_register()
-    if rc != 0:
-        return rc
+    ctx = _PhotonSetupContext.from_args(args)
+    setattr(args, "auto_create_project", True)
+    _print_quick_setup_log_paths(ctx)
+    _init_log_offsets(ctx)
+
+    try:
+        with photon_auth.setup_lock():
+            _run_quick_setup_reconciler(ctx)
+    except TimeoutError as e:
+        failure = _failed_invariant(
+            ctx,
+            step="setup lock",
+            summary="another Photon setup process is already running",
+            expected="exclusive access to Photon setup state",
+            observed=str(e),
+            repair="wait for the other setup to finish, then rerun quick-setup",
+        )
+        _finalize_failed_invariant_logs(failure, ctx)
+        _print_failed_invariant(failure)
+        return 1
+    except _FailedInvariant as e:
+        _finalize_failed_invariant_logs(e, ctx)
+        _print_failed_invariant(e)
+        return 1
+    except Exception as e:
+        failure = _failed_invariant(
+            ctx,
+            step="quick setup",
+            summary="unexpected Photon quick-setup failure",
+            expected="all Photon runtime invariants reconciled",
+            observed=f"{type(e).__name__}: {e}",
+            repair="rerun with `hermes photon status`; if it repeats, inspect IMPLEMENTATION_ERRORS.md and gateway logs",
+        )
+        _finalize_failed_invariant_logs(failure, ctx)
+        _print_failed_invariant(failure)
+        return 1
 
     print()
-    _print_quick_setup_complete(outcome)
+    _print_quick_setup_reconciled(ctx)
     return 0
+
+
+def _run_quick_setup_reconciler(ctx: _PhotonSetupContext) -> None:
+    token = _ensure_dashboard_auth(ctx)
+    _ensure_spectrum_project(ctx, token)
+    _ensure_active_home_available(ctx)
+    _ensure_operator_phone(ctx)
+    _ensure_sidecar_ready(ctx)
+    _ensure_gateway_local_runtime(ctx)
+    _ensure_public_webhook_path(ctx)
+    webhook_result = _ensure_current_webhook_registered(ctx)
+    ctx.registered_hooks = webhook_result.hooks
+    ctx.runtime_secrets_changed = (
+        ctx.runtime_secrets_changed
+        or webhook_result.secret_changed
+        or webhook_result.public_url_changed
+    )
+    if ctx.runtime_secrets_changed:
+        _restart_current_home_gateway(ctx)
+        _wait_for_local_health(ctx, reason="gateway restart after Photon secret update")
+        _wait_for_public_health(ctx, reason="gateway restart after Photon secret update")
+    else:
+        _wait_for_public_health(ctx, reason="post-webhook verification")
+    _wait_for_photon_connected(ctx)
+
+
+def _ensure_dashboard_auth(ctx: _PhotonSetupContext) -> str:
+    print("[auth] Validating Photon dashboard login...")
+    token = photon_auth.load_photon_token()
+    if token:
+        try:
+            photon_auth.validate_photon_token(token)
+            print("  ✓ dashboard token is valid for Photon project APIs")
+            return token
+        except photon_auth.PhotonDashboardAuthError:
+            photon_auth.clear_photon_token()
+            print("  saved dashboard token is invalid; running device login")
+            token = None
+        except Exception as e:
+            if _http_status(e) in {401, 403}:
+                photon_auth.clear_photon_token()
+                print("  saved dashboard token was rejected; running device login")
+                token = None
+            else:
+                raise _failed_invariant(
+                    ctx,
+                    step="dashboard auth",
+                    summary="could not validate Photon dashboard token",
+                    expected="saved token can access Photon project APIs",
+                    observed=f"{type(e).__name__}: {e}",
+                    evidence={"dashboard_host": _dashboard_url().rstrip("/")},
+                    repair="check network access to Photon, then rerun quick-setup",
+                ) from e
+        if token:
+            return token
+    else:
+        print("  no dashboard token found; running device login")
+
+    rc = _cmd_login(ctx.args)
+    if rc != 0:
+        raise _failed_invariant(
+            ctx,
+            step="dashboard auth",
+            summary="Photon device login did not complete",
+            expected="device login stores a dashboard API token",
+            observed=f"login command exited with {rc}",
+            evidence={"dashboard_host": _dashboard_url().rstrip("/")},
+            repair="complete `hermes photon login`, then rerun quick-setup",
+        )
+    token = photon_auth.load_photon_token()
+    if not token:
+        raise _failed_invariant(
+            ctx,
+            step="dashboard auth",
+            summary="Photon login completed but no token was saved",
+            expected="PHOTON_DASHBOARD_TOKEN stored in Hermes env",
+            observed="missing PHOTON_DASHBOARD_TOKEN",
+            repair=f"inspect env file permissions at {ctx.env_path}",
+        )
+    try:
+        photon_auth.validate_photon_token(token)
+    except Exception as e:
+        raise _failed_invariant(
+            ctx,
+            step="dashboard auth",
+            summary="new Photon dashboard token is not valid for project APIs",
+            expected="device login returns a project-valid dashboard token",
+            observed=f"{type(e).__name__}: {e}",
+            evidence={"dashboard_host": _dashboard_url().rstrip("/")},
+            repair="retry login; if it repeats, Photon must return or accept a project API bearer token",
+        ) from e
+    print("  ✓ dashboard token is valid for Photon project APIs")
+    return token
+
+
+def _ensure_spectrum_project(ctx: _PhotonSetupContext, token: str) -> None:
+    print("[project] Reconciling Photon Spectrum project...")
+    existing_id, existing_secret = photon_auth.load_project_credentials()
+    if existing_id and existing_secret and not getattr(ctx.args, "new_project", False):
+        try:
+            hooks = photon_auth.list_webhooks(existing_id, existing_secret)
+        except Exception as e:
+            if _http_status(e) == 401:
+                print("  stored Spectrum credentials were rejected; clearing cached project state")
+                _clear_local_project_runtime_state()
+            else:
+                raise _failed_invariant(
+                    ctx,
+                    step="Spectrum credentials",
+                    summary="stored Spectrum credentials could not be validated",
+                    expected="PHOTON_PROJECT_ID and PHOTON_PROJECT_SECRET can call Spectrum APIs",
+                    observed=f"{type(e).__name__}: {e}",
+                    evidence={"project_id": existing_id},
+                    repair="check network access to Photon Spectrum, then rerun quick-setup",
+                ) from e
+        else:
+            ctx.project_id = existing_id
+            ctx.project_secret = existing_secret
+            ctx.registered_hooks = hooks
+            print("  ✓ stored Spectrum credentials validated")
+            return
+
+    try:
+        project_id, project_secret = _resolve_setup_project(
+            ctx.args,
+            token,
+            total_steps=16,
+        )
+    except Exception as e:
+        raise _failed_invariant(
+            ctx,
+            step="project selection",
+            summary="could not resolve a compatible Photon project",
+            expected="exactly one compatible project adopted or one new project created",
+            observed=f"{type(e).__name__}: {e}",
+            repair="run `hermes photon projects list` to inspect available projects",
+        ) from e
+    if not (project_id and project_secret):
+        raise _failed_invariant(
+            ctx,
+            step="project selection",
+            summary="no compatible Photon Spectrum project was selected",
+            expected="one compatible Spectrum/iMessage project",
+            observed="project id or secret missing after project reconciliation",
+            repair="select one project with `hermes photon projects select <id>` or rerun with `--new-project`",
+        )
+
+    try:
+        hooks = photon_auth.list_webhooks(project_id, project_secret)
+    except Exception as e:
+        raise _failed_invariant(
+            ctx,
+            step="Spectrum credentials",
+            summary="newly selected Spectrum credentials failed validation",
+            expected="selected project credentials can call Spectrum APIs",
+            observed=f"{type(e).__name__}: {e}",
+            evidence={"project_id": project_id, "http_status": _http_status(e)},
+            repair="select a different project or rerun quick-setup with `--new-project`",
+        ) from e
+
+    ctx.project_id = project_id
+    ctx.project_secret = project_secret
+    ctx.registered_hooks = hooks
+    print("  ✓ Spectrum credentials validated")
+
+
+def _ensure_active_home_available(ctx: _PhotonSetupContext) -> None:
+    mismatch = photon_tunnel.active_home_mismatch()
+    if not mismatch:
+        print("[owner] Photon active-home claim is available for this Hermes home")
+        return
+    owner_home, current_home = mismatch
+    raise _failed_invariant(
+        ctx,
+        step="active Hermes home ownership",
+        summary="Photon project is claimed by another Hermes home",
+        expected="active-home owner is empty or matches the current Hermes home",
+        observed={
+            "owner_home": owner_home,
+            "current_home": current_home,
+            "active_home_file": str(photon_tunnel.active_home_path()),
+            "record": photon_tunnel.active_home_record(),
+        },
+        repair="run quick-setup from the owning Hermes home, or reset Photon from that home before trying this one",
+    )
+
+
+def _ensure_operator_phone(ctx: _PhotonSetupContext) -> None:
+    print("[phone] Reconciling Spectrum shared iMessage user...")
+    phone = ctx.args.phone or _prompt(
+        f"Your iMessage phone number (E.164, format {_PHONE_FORMAT}): "
+    )
+    ctx.operator_phone = phone or None
+    if not phone:
+        raise _failed_invariant(
+            ctx,
+            step="operator phone",
+            summary="operator phone number is required",
+            expected=f"an E.164 phone number like {_PHONE_FORMAT}",
+            observed="missing --phone and no interactive phone was provided",
+            repair=f"rerun `hermes photon quick-setup --phone {_PHONE_ARG_PLACEHOLDER}`",
+        )
+    if not photon_auth.E164_RE.match(phone):
+        raise _failed_invariant(
+            ctx,
+            step="operator phone",
+            summary="operator phone number is not E.164",
+            expected=f"format {_PHONE_FORMAT}",
+            observed=phone,
+            repair=f"rerun with a phone number like {_PHONE_ARG_PLACEHOLDER}",
+        )
+
+    try:
+        user = photon_auth.create_user(
+            ctx.project_id,
+            ctx.project_secret,
+            phone_number=phone,
+            first_name=ctx.args.first_name,
+            last_name=ctx.args.last_name,
+            email=ctx.args.email,
+        )
+    except Exception as e:
+        if _error_looks_like_existing_user(e):
+            print("  ✓ phone already exists as a Spectrum user")
+            user = {}
+        else:
+            raise _failed_invariant(
+                ctx,
+                step="Spectrum user",
+                summary="could not create or verify the Spectrum user",
+                expected="operator phone exists as a shared Spectrum iMessage user",
+                observed=f"{type(e).__name__}: {e}",
+                evidence={"project_id": ctx.project_id, "http_status": _http_status(e)},
+                repair="verify the phone number in Photon, then rerun quick-setup",
+            ) from e
+
+    ctx.assigned_phone_number = _extract_assigned_phone_number(user)
+    if ctx.assigned_phone_number:
+        print(f"  ✓ assigned Photon iMessage number: {ctx.assigned_phone_number}")
+    else:
+        print("  ✓ Spectrum user is present; Photon did not return the assigned iMessage number")
+    if not _ensure_operator_phone_allowed(phone):
+        raise _failed_invariant(
+            ctx,
+            step="sender access",
+            summary="operator phone was not authorized in Hermes sender access",
+            expected="operator phone is present in PHOTON_ALLOWED_USERS or access is open",
+            observed=_photon_sender_access_status(),
+            repair=f"run `hermes photon allow-phone {phone}`",
+        )
+
+
+def _ensure_sidecar_ready(ctx: _PhotonSetupContext) -> None:
+    print("[sidecar] Verifying Node sidecar dependencies...")
+    node_bin = os.getenv("PHOTON_NODE_BIN") or "node"
+    if not shutil.which(node_bin):
+        raise _failed_invariant(
+            ctx,
+            step="sidecar dependencies",
+            summary="Node.js is not available for the Photon sidecar",
+            expected="Node.js 20.18.1+ is on PATH or PHOTON_NODE_BIN points to it",
+            observed=f"missing node binary: {node_bin}",
+            evidence={"sidecar_dir": str(_SIDECAR_DIR)},
+            repair="install Node.js 20.18.1+, then rerun quick-setup",
+        )
+
+    status = _sidecar_dependency_status()
+    if status.startswith("✓"):
+        print(f"  {status}")
+        return
+    if getattr(ctx.args, "skip_sidecar_install", False):
+        raise _failed_invariant(
+            ctx,
+            step="sidecar dependencies",
+            summary="Photon sidecar dependencies are not installed",
+            expected="spectrum-ts dependency is installed and current",
+            observed=status,
+            evidence={"sidecar_dir": str(_SIDECAR_DIR)},
+            repair="rerun without `--skip-sidecar-install` or run `hermes photon install-sidecar`",
+        )
+
+    rc = _install_sidecar()
+    if rc != 0:
+        raise _failed_invariant(
+            ctx,
+            step="sidecar dependencies",
+            summary="npm install failed for the Photon sidecar",
+            expected="npm install completes successfully",
+            observed=f"npm exited with {rc}",
+            evidence={"sidecar_dir": str(_SIDECAR_DIR)},
+            repair="fix npm/Node errors shown above, then rerun quick-setup",
+        )
+    status = _sidecar_dependency_status()
+    if not status.startswith("✓"):
+        raise _failed_invariant(
+            ctx,
+            step="sidecar dependencies",
+            summary="Photon sidecar dependencies still are not runnable after install",
+            expected="spectrum-ts dependency is installed and current",
+            observed=status,
+            evidence={"sidecar_dir": str(_SIDECAR_DIR)},
+            repair="inspect npm output in the sidecar directory, then rerun quick-setup",
+        )
+    print(f"  {status}")
+
+
+def _ensure_gateway_local_runtime(ctx: _PhotonSetupContext) -> None:
+    print("[gateway] Ensuring current-home gateway serves local Photon health...")
+    service = _inspect_gateway_service_identity(ctx)
+    _fail_if_service_home_mismatch(ctx, service)
+    runtime = _inspect_gateway_runtime()
+    _assert_runtime_project_matches(ctx, runtime)
+    local = _check_local_health(ctx)
+    ctx.local_health = local
+    if local.ok and runtime.get("running"):
+        print(f"  ✓ local health reachable ({local.url})")
+        return
+    if local.ok and not runtime.get("running"):
+        raise _failed_invariant(
+            ctx,
+            step="gateway service identity",
+            summary="local Photon health is served by a gateway outside this Hermes home",
+            expected="local health is served by the current Hermes home gateway",
+            observed={
+                "local_health": _health_evidence(local),
+                "current_home_gateway": runtime,
+                "port_owner": _port_owner(ctx.webhook_port),
+            },
+            evidence={"service": service},
+            repair="stop the other gateway or rerun quick-setup from the Hermes home that owns the port",
+        )
+
+    owner = _port_owner(ctx.webhook_port)
+    if owner.get("present") and not runtime.get("running"):
+        raise _failed_invariant(
+            ctx,
+            step="local webhook port",
+            summary="Photon webhook port is owned by another process",
+            expected=f"current-home gateway can bind 127.0.0.1:{ctx.webhook_port}",
+            observed=owner,
+            evidence={"local_health": _health_evidence(local), "service": service},
+            repair=f"stop the process using port {ctx.webhook_port}, then rerun quick-setup",
+        )
+
+    _start_current_home_gateway(ctx, service)
+    _wait_for_local_health(ctx, reason="gateway startup")
+
+
+def _ensure_public_webhook_path(ctx: _PhotonSetupContext) -> None:
+    print("[tunnel] Ensuring public webhook health...")
+    configured = (_get_env_value("PHOTON_WEBHOOK_PUBLIC_URL") or "").strip()
+    if configured and not photon_tunnel.is_trycloudflare_url(configured):
+        ctx.webhook_url = configured
+        print(f"  using user-owned public webhook URL: {configured}")
+        _wait_for_public_health(ctx, reason="user-owned public URL")
+        return
+
+    result = photon_tunnel.start(on_install=print)
+    if not result.success:
+        raise _failed_invariant(
+            ctx,
+            step="managed tunnel",
+            summary="Cloudflare Quick Tunnel did not start",
+            expected="managed tunnel publishes a trycloudflare.com URL",
+            observed=result.error or "unknown cloudflared failure",
+            evidence={
+                "cloudflared_log": str(result.log_path) if result.log_path else "",
+                "command": result.command,
+                "local_health": _health_evidence(ctx.local_health),
+            },
+            repair="inspect the cloudflared log and rerun quick-setup; install cloudflared manually if managed install failed",
+        )
+    ctx.webhook_url = result.webhook_url
+    action = "reused" if result.reused else "started"
+    print(f"  ✓ {action} managed tunnel: {result.webhook_url}")
+    _wait_for_public_health(ctx, reason="managed tunnel startup")
+
+
+def _ensure_current_webhook_registered(
+    ctx: _PhotonSetupContext,
+) -> _WebhookEnsureResult:
+    print("[webhook] Reconciling Photon webhook registration...")
+    try:
+        hooks = photon_auth.list_webhooks(ctx.project_id, ctx.project_secret)
+    except Exception as e:
+        raise _failed_invariant(
+            ctx,
+            step="registered webhook state",
+            summary="could not list Photon webhooks",
+            expected="Spectrum API returns registered webhooks for the current project",
+            observed=f"{type(e).__name__}: {e}",
+            evidence={"project_id": ctx.project_id, "http_status": _http_status(e)},
+            repair="validate Photon project credentials, then rerun quick-setup",
+        ) from e
+
+    hooks = _delete_stale_managed_webhooks(
+        ctx.project_id,
+        ctx.project_secret,
+        hooks,
+        keep_url=ctx.webhook_url,
+    )
+    matching_hooks = [hook for hook in hooks if _webhook_url(hook) == ctx.webhook_url]
+    if matching_hooks and _webhook_secret_present():
+        public_changed = _save_public_webhook_url_checked(ctx, ctx.webhook_url)
+        _claim_active_home_checked(ctx)
+        verified = _verify_current_webhook_registered(ctx)
+        print("  ✓ current webhook URL is registered and local signing secret is present")
+        return _WebhookEnsureResult(
+            hooks=verified,
+            registered=True,
+            public_url_changed=public_changed,
+        )
+
+    if matching_hooks:
+        if photon_tunnel.is_trycloudflare_url(ctx.webhook_url):
+            deleted = _delete_matching_webhook(
+                ctx.project_id,
+                ctx.project_secret,
+                matching_hooks,
+                ctx.webhook_url,
+                reason="managed webhook with missing local signing secret",
+            )
+            if not deleted:
+                raise _failed_invariant(
+                    ctx,
+                    step="webhook signing secret",
+                    summary="current managed webhook exists but local signing secret is missing",
+                    expected="local PHOTON_WEBHOOK_SECRET matches the registered current webhook",
+                    observed={
+                        "webhook_url": ctx.webhook_url,
+                        "matching_webhook_ids": [_webhook_id(hook) for hook in matching_hooks],
+                        "owned_webhook_ids": sorted(photon_tunnel.owned_webhook_ids()),
+                    },
+                    repair="delete the webhook manually only if it belongs to this setup, then rerun quick-setup",
+                )
+            hooks = [hook for hook in hooks if _webhook_url(hook) != ctx.webhook_url]
+        else:
+            raise _failed_invariant(
+                ctx,
+                step="webhook signing secret",
+                summary="current user-owned webhook exists but local signing secret is missing",
+                expected="PHOTON_WEBHOOK_SECRET is present for the registered webhook URL",
+                observed={"webhook_url": ctx.webhook_url},
+                repair="recreate the webhook in Photon and save the returned signing secret locally",
+            )
+
+    try:
+        data = photon_auth.register_webhook(
+            ctx.project_id,
+            ctx.project_secret,
+            webhook_url=ctx.webhook_url,
+        )
+    except Exception as e:
+        raise _failed_invariant(
+            ctx,
+            step="webhook registration",
+            summary="Photon rejected the current webhook URL registration",
+            expected="Spectrum API registers the current public webhook URL",
+            observed=f"{type(e).__name__}: {e}",
+            evidence={
+                "webhook_url": ctx.webhook_url,
+                "project_id": ctx.project_id,
+                "http_status": _http_status(e),
+                "public_health": _public_health_evidence(ctx.public_health),
+            },
+            repair="fix the public webhook URL or Photon project credentials, then rerun quick-setup",
+        ) from e
+
+    webhook_id = _webhook_id(data)
+    if webhook_id and photon_tunnel.is_trycloudflare_url(ctx.webhook_url):
+        photon_tunnel.record_owned_webhook(webhook_id, ctx.webhook_url)
+    if not photon_auth.persist_webhook_signing_secret(data, on_summary=print):
+        raise _failed_invariant(
+            ctx,
+            step="webhook signing secret",
+            summary="Photon did not return or Hermes could not save the webhook signing secret",
+            expected="registration response includes a signing secret saved to Hermes env",
+            observed={
+                "webhook_id": webhook_id or "",
+                "webhook_url": ctx.webhook_url,
+                "env_path": str(ctx.env_path),
+            },
+            repair="inspect env file permissions; do not retry without first deleting the orphaned owned webhook if one was created",
+        )
+    public_changed = _save_public_webhook_url_checked(ctx, ctx.webhook_url)
+    _claim_active_home_checked(ctx)
+    verified = _verify_current_webhook_registered(ctx)
+    print("  ✓ current webhook URL registered and signing secret saved")
+    return _WebhookEnsureResult(
+        hooks=verified,
+        registered=True,
+        secret_changed=True,
+        public_url_changed=public_changed,
+    )
+
+
+def _restart_current_home_gateway(ctx: _PhotonSetupContext) -> None:
+    print("[gateway] Restarting current-home gateway to load updated Photon secrets...")
+    service = _inspect_gateway_service_identity(ctx)
+    _fail_if_service_home_mismatch(ctx, service)
+    try:
+        if service.get("installed") and service.get("manager") == "launchd":
+            from hermes_cli import gateway as gateway_cli  # type: ignore
+
+            gateway_cli.launchd_restart()
+            return
+        if service.get("installed") and service.get("manager") == "systemd":
+            from hermes_cli import gateway as gateway_cli  # type: ignore
+
+            gateway_cli.systemd_restart(system=service.get("scope") == "system")
+            return
+        _launch_detached_gateway(ctx)
+    except Exception as e:
+        raise _failed_invariant(
+            ctx,
+            step="gateway restart",
+            summary="current-home gateway could not be restarted after Photon secrets changed",
+            expected="gateway restarts and reloads Photon env values",
+            observed=f"{type(e).__name__}: {e}",
+            evidence={"service": service, "runtime": _inspect_gateway_runtime()},
+            repair="repair the current-home gateway service, then rerun quick-setup",
+        ) from e
+
+
+def _wait_for_photon_connected(ctx: _PhotonSetupContext, timeout_seconds: float = 60.0) -> None:
+    print("[runtime] Waiting for gateway runtime status photon=connected...")
+    deadline = time.monotonic() + timeout_seconds
+    last_status: dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        runtime = _inspect_gateway_runtime()
+        _assert_runtime_project_matches(ctx, runtime)
+        last_status = runtime
+        photon_state = (
+            (runtime.get("status") or {})
+            .get("platforms", {})
+            .get("photon", {})
+            .get("state")
+        )
+        if photon_state == "connected":
+            print("  ✓ gateway runtime reports photon=connected")
+            return
+        if photon_state == "fatal":
+            break
+        _stream_quick_setup_logs(ctx)
+        time.sleep(1)
+
+    photon_status = (
+        (last_status.get("status") or {})
+        .get("platforms", {})
+        .get("photon", {})
+    )
+    raise _failed_invariant(
+        ctx,
+        step="gateway runtime status",
+        summary="gateway did not report photon=connected",
+        expected="gateway_state includes platforms.photon.state=connected",
+        observed=photon_status or last_status,
+        evidence={
+            "local_health": _health_evidence(ctx.local_health),
+            "public_health": _public_health_evidence(ctx.public_health),
+            "service": _inspect_gateway_service_identity(ctx),
+            "runtime": last_status,
+        },
+        repair="inspect gateway logs for the Photon adapter error, then rerun quick-setup",
+    )
+
+
+def _start_current_home_gateway(ctx: _PhotonSetupContext, service: dict[str, Any]) -> None:
+    try:
+        if service.get("installed") and service.get("manager") == "launchd":
+            from hermes_cli import gateway as gateway_cli  # type: ignore
+
+            gateway_cli.launchd_start()
+            return
+        if service.get("installed") and service.get("manager") == "systemd":
+            from hermes_cli import gateway as gateway_cli  # type: ignore
+
+            gateway_cli.systemd_start(system=service.get("scope") == "system")
+            return
+        _launch_detached_gateway(ctx)
+    except Exception as e:
+        raise _failed_invariant(
+            ctx,
+            step="gateway startup",
+            summary="current-home gateway could not be started",
+            expected="gateway process starts for the active Hermes home",
+            observed=f"{type(e).__name__}: {e}",
+            evidence={"service": service, "runtime": _inspect_gateway_runtime()},
+            repair="repair the current-home gateway service or start `hermes gateway run --replace` from this Hermes home",
+        ) from e
+
+
+def _launch_detached_gateway(ctx: _PhotonSetupContext) -> None:
+    log_dir = ctx.hermes_home / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / "photon-quick-setup-gateway.log"
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(ctx.hermes_home)
+    command = [
+        sys.executable,
+        "-m",
+        "hermes_cli.main",
+        "gateway",
+        "run",
+        "--replace",
+    ]
+    project_root = Path(__file__).resolve().parents[3]
+    with log_path.open("ab") as log_file:
+        subprocess.Popen(  # noqa: S603
+            command,
+            cwd=str(project_root),
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    ctx.gateway_started = True
+    print(f"  started current-home gateway process (log: {log_path})")
+
+
+def _quick_setup_log_paths(ctx: _PhotonSetupContext) -> dict[str, Path]:
+    log_dir = ctx.hermes_home / "logs"
+    return {
+        "gateway": log_dir / "gateway.log",
+        "errors": log_dir / "errors.log",
+        "gateway-error": log_dir / "gateway.error.log",
+        "cloudflared": photon_tunnel.log_path(),
+    }
+
+
+def _print_quick_setup_log_paths(ctx: _PhotonSetupContext) -> None:
+    print("[logs] Existing logs for this setup:")
+    for label, path in _quick_setup_log_paths(ctx).items():
+        print(f"  {label:<13}: {path}")
+    if ctx.verbose:
+        print("  verbose       : streaming new log lines while setup waits")
+
+
+def _init_log_offsets(ctx: _PhotonSetupContext) -> None:
+    ctx.log_offsets = {}
+    for label, path in _quick_setup_log_paths(ctx).items():
+        try:
+            ctx.log_offsets[label] = path.stat().st_size
+        except OSError:
+            ctx.log_offsets[label] = 0
+
+
+def _stream_quick_setup_logs(ctx: _PhotonSetupContext) -> None:
+    if not ctx.verbose:
+        return
+    for label, path in _quick_setup_log_paths(ctx).items():
+        offset = ctx.log_offsets.get(label, 0)
+        try:
+            with path.open("rb") as fh:
+                fh.seek(max(0, offset))
+                data = fh.read()
+                ctx.log_offsets[label] = fh.tell()
+        except OSError:
+            continue
+        if not data:
+            continue
+        for line in data.decode("utf-8", errors="replace").splitlines():
+            rendered = _redact_log_line(line).strip()
+            if rendered:
+                print(f"[{label}] {rendered[:500]}")
+
+
+def _collect_relevant_log_tail(
+    ctx: _PhotonSetupContext,
+    *,
+    max_lines: int = 40,
+) -> dict[str, list[str]]:
+    logs: dict[str, list[str]] = {}
+    for label, path in _quick_setup_log_paths(ctx).items():
+        lines = _tail_text_file(path, max_lines=max_lines * 4)
+        relevant = [
+            _redact_log_line(line)
+            for line in lines
+            if _log_line_is_relevant(line)
+        ]
+        if not relevant:
+            relevant = [_redact_log_line(line) for line in lines[-8:]]
+        relevant = [line for line in relevant if line.strip()]
+        if relevant:
+            logs[label] = relevant[-max_lines:]
+    return logs
+
+
+def _tail_text_file(path: Path, *, max_lines: int) -> list[str]:
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    return text.splitlines()[-max_lines:]
+
+
+def _log_line_is_relevant(line: str) -> bool:
+    lowered = line.lower()
+    markers = (
+        "photon",
+        "spectrum",
+        "webhook",
+        "cloudflared",
+        "gateway",
+        "health",
+        "error",
+        "failed",
+        "fatal",
+        "paused",
+        "connected",
+        "traceback",
+        "exception",
+        "unauthorized",
+        "401",
+    )
+    return any(marker in lowered for marker in markers)
+
+
+def _redact_log_line(line: str) -> str:
+    redacted = str(line)
+    redacted = re.sub(
+        r"(?i)(authorization:\s*bearer\s+)[^\s]+",
+        r"\1<redacted>",
+        redacted,
+    )
+    redacted = re.sub(
+        r"(?i)(PHOTON_PROJECT_SECRET=)[^\s]+",
+        r"\1<redacted>",
+        redacted,
+    )
+    redacted = re.sub(
+        r"(?i)(PHOTON_WEBHOOK_SECRET=)[^\s]+",
+        r"\1<redacted>",
+        redacted,
+    )
+    redacted = re.sub(
+        r"(?i)(PHOTON_DASHBOARD_TOKEN=)[^\s]+",
+        r"\1<redacted>",
+        redacted,
+    )
+    redacted = re.sub(
+        r'(?i)("?(?:projectSecret|signingSecret|secret|token)"?\s*[:=]\s*")([^"]+)(")',
+        r"\1<redacted>\3",
+        redacted,
+    )
+    return redacted
+
+
+def _finalize_failed_invariant_logs(
+    error: _FailedInvariant,
+    ctx: _PhotonSetupContext,
+) -> None:
+    _stream_quick_setup_logs(ctx)
+    if not error.logs:
+        error.logs = _collect_relevant_log_tail(ctx)
+
+
+def _runtime_photon_status(runtime: dict[str, Any]) -> dict[str, Any]:
+    status = runtime.get("status") or {}
+    platforms = status.get("platforms") or {}
+    photon = platforms.get("photon") or {}
+    return photon if isinstance(photon, dict) else {}
+
+
+def _runtime_photon_project_id(runtime: dict[str, Any]) -> str:
+    photon = _runtime_photon_status(runtime)
+    for key in ("project_id", "projectId", "spectrum_project_id", "spectrumProjectId"):
+        value = photon.get(key)
+        if value:
+            return str(value)
+    metadata = photon.get("metadata")
+    if isinstance(metadata, dict):
+        for key in ("project_id", "projectId", "spectrum_project_id", "spectrumProjectId"):
+            value = metadata.get(key)
+            if value:
+                return str(value)
+    for key in ("error_message", "message", "detail"):
+        value = photon.get(key)
+        if isinstance(value, str):
+            parsed = _project_id_from_text(value)
+            if parsed:
+                return parsed
+    return ""
+
+
+def _project_id_from_text(text: str) -> str:
+    match = re.search(
+        r"/projects/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})(?:/|$)",
+        text or "",
+    )
+    return match.group(1) if match else ""
+
+
+def _assert_runtime_project_matches(
+    ctx: _PhotonSetupContext,
+    runtime: dict[str, Any],
+) -> None:
+    if not ctx.project_id:
+        return
+    runtime_project_id = _runtime_photon_project_id(runtime)
+    if not runtime_project_id or runtime_project_id == ctx.project_id:
+        return
+    raise _failed_invariant(
+        ctx,
+        step="gateway runtime project identity",
+        summary="gateway loaded a different Photon project than quick-setup validated",
+        expected=f"gateway Photon project id {ctx.project_id}",
+        observed={
+            "setup_project_id": ctx.project_id,
+            "gateway_project_id": runtime_project_id,
+        },
+        evidence={
+            "runtime": runtime,
+            "service": _inspect_gateway_service_identity(ctx),
+            "log_paths": {
+                label: str(path)
+                for label, path in _quick_setup_log_paths(ctx).items()
+            },
+        },
+        repair="restart the current-home gateway so it reloads the reconciled Photon env state, then rerun quick-setup",
+    )
+
+
+def _wait_for_local_health(
+    ctx: _PhotonSetupContext,
+    *,
+    reason: str,
+    timeout_seconds: float = 60.0,
+) -> None:
+    print(f"  waiting for local health: {_local_health_url(ctx)}")
+    deadline = time.monotonic() + timeout_seconds
+    last = _check_local_health(ctx)
+    while time.monotonic() < deadline:
+        _assert_runtime_project_matches(ctx, _inspect_gateway_runtime())
+        if last.ok:
+            ctx.local_health = last
+            print(f"  ✓ local health reachable ({last.url})")
+            return
+        _stream_quick_setup_logs(ctx)
+        time.sleep(1)
+        last = _check_local_health(ctx)
+
+    ctx.local_health = last
+    raise _failed_invariant(
+        ctx,
+        step="local webhook health",
+        summary="current-home gateway did not serve local Photon health",
+        expected=f"{_local_health_url(ctx)} returns HTTP 200 with body ok",
+        observed=_health_evidence(last),
+        evidence={
+            "reason": reason,
+            "service": _inspect_gateway_service_identity(ctx),
+            "runtime": _inspect_gateway_runtime(),
+            "port_owner": _port_owner(ctx.webhook_port),
+        },
+        repair="inspect the gateway log and fix the Photon adapter startup error, then rerun quick-setup",
+    )
+
+
+def _wait_for_public_health(
+    ctx: _PhotonSetupContext,
+    *,
+    reason: str,
+    timeout_seconds: float = 60.0,
+) -> None:
+    print(f"  waiting for public health: {photon_tunnel.health_url_for_webhook_url(ctx.webhook_url)}")
+    deadline = time.monotonic() + timeout_seconds
+    last = photon_tunnel.check_public_health(ctx.webhook_url)
+    while time.monotonic() < deadline:
+        _assert_runtime_project_matches(ctx, _inspect_gateway_runtime())
+        ctx.public_health = last
+        if last[0]:
+            print(f"  ✓ public health reachable ({last[1]})")
+            return
+        if not _public_health_can_be_transient(last[1]):
+            break
+        _stream_quick_setup_logs(ctx)
+        time.sleep(2)
+        last = photon_tunnel.check_public_health(ctx.webhook_url)
+
+    ctx.public_health = last
+    local = _check_local_health(ctx)
+    ctx.local_health = local
+    if not local.ok:
+        raise _failed_invariant(
+            ctx,
+            step="public webhook health",
+            summary="public webhook health failed because local Photon health is down",
+            expected="local health works before Cloudflare forwards public health",
+            observed={
+                "public_health": _public_health_evidence(last),
+                "local_health": _health_evidence(local),
+            },
+            evidence={
+                "reason": reason,
+                "service": _inspect_gateway_service_identity(ctx),
+                "runtime": _inspect_gateway_runtime(),
+                "port_owner": _port_owner(ctx.webhook_port),
+            },
+            repair="repair the current-home gateway local health before changing tunnel or webhook state",
+        )
+    raise _failed_invariant(
+        ctx,
+        step="public webhook health",
+        summary="public webhook URL did not forward to the local Photon gateway",
+        expected="public /healthz returns HTTP 200 with body ok",
+        observed=_public_health_evidence(last),
+        evidence={
+            "reason": reason,
+            "webhook_url": ctx.webhook_url,
+            "local_health": _health_evidence(local),
+            "managed_tunnel": photon_tunnel.status(),
+        },
+        repair="restart the managed tunnel or repair the user-owned public URL, then rerun quick-setup",
+    )
+
+
+def _verify_current_webhook_registered(ctx: _PhotonSetupContext) -> list:
+    try:
+        hooks = photon_auth.list_webhooks(ctx.project_id, ctx.project_secret)
+    except Exception as e:
+        raise _failed_invariant(
+            ctx,
+            step="registered webhook state",
+            summary="could not verify registered webhooks after reconciliation",
+            expected="Spectrum API lists the current webhook URL",
+            observed=f"{type(e).__name__}: {e}",
+            evidence={"project_id": ctx.project_id, "http_status": _http_status(e)},
+            repair="check Photon Spectrum API access, then rerun quick-setup",
+        ) from e
+    if not any(_webhook_url(hook) == ctx.webhook_url for hook in hooks):
+        raise _failed_invariant(
+            ctx,
+            step="registered webhook state",
+            summary="current webhook URL is still not registered",
+            expected="Photon registered webhook list contains the current webhook URL",
+            observed={
+                "webhook_url": ctx.webhook_url,
+                "registered_webhooks": [
+                    {"id": _webhook_id(hook), "url": _webhook_url(hook)}
+                    for hook in hooks
+                ],
+            },
+            repair="rerun quick-setup; if it repeats, inspect Photon dashboard webhook state",
+        )
+    return hooks
+
+
+def _claim_active_home_checked(ctx: _PhotonSetupContext) -> None:
+    try:
+        photon_tunnel.record_active_hermes_home(
+            project_id=ctx.project_id,
+            webhook_url=ctx.webhook_url,
+        )
+    except Exception as e:
+        raise _failed_invariant(
+            ctx,
+            step="active Hermes home ownership",
+            summary="could not record the active Photon Hermes home",
+            expected="active-home claim is written after webhook registration",
+            observed=f"{type(e).__name__}: {e}",
+            evidence={"active_home_file": str(photon_tunnel.active_home_path())},
+            repair="fix permissions on the active-home file location, then rerun quick-setup",
+        ) from e
+
+
+def _save_public_webhook_url_checked(ctx: _PhotonSetupContext, url: str) -> bool:
+    current = (_get_env_value("PHOTON_WEBHOOK_PUBLIC_URL") or "").strip()
+    if current == url:
+        return False
+    try:
+        from hermes_cli.config import save_env_value  # type: ignore
+
+        save_env_value("PHOTON_WEBHOOK_PUBLIC_URL", url)
+    except Exception as e:
+        raise _failed_invariant(
+            ctx,
+            step="webhook env state",
+            summary="could not save PHOTON_WEBHOOK_PUBLIC_URL",
+            expected="current webhook URL is saved in Hermes env",
+            observed=f"{type(e).__name__}: {e}",
+            evidence={"env_path": str(ctx.env_path), "webhook_url": url},
+            repair="fix Hermes env file permissions, then rerun quick-setup",
+        ) from e
+    return True
+
+
+def _clear_local_project_runtime_state() -> None:
+    for key in (
+        "PHOTON_PROJECT_ID",
+        "PHOTON_PROJECT_SECRET",
+        "PHOTON_WEBHOOK_SECRET",
+        "PHOTON_WEBHOOK_PUBLIC_URL",
+    ):
+        _remove_env_value(key)
+
+
+def _remove_env_value(key: str) -> bool:
+    try:
+        from hermes_cli.config import remove_env_value  # type: ignore
+
+        return bool(remove_env_value(key))
+    except Exception:
+        return os.environ.pop(key, None) is not None
+
+
+def _error_looks_like_existing_user(exc: BaseException) -> bool:
+    status = _http_status(exc)
+    if status == 409:
+        return True
+    detail = str(exc).lower()
+    return "already" in detail and "user" in detail
+
+
+def _http_status(exc: BaseException) -> Optional[int]:
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    try:
+        return int(status) if status is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _inspect_gateway_service_identity(ctx: _PhotonSetupContext) -> dict[str, Any]:
+    evidence: dict[str, Any] = {
+        "manager": "manual",
+        "installed": False,
+        "running": False,
+        "path": "",
+        "service_home": "",
+        "expected_home": _canonical_path_str(ctx.hermes_home),
+    }
+    try:
+        from hermes_cli import gateway as gateway_cli  # type: ignore
+    except Exception as e:
+        evidence["error"] = f"{type(e).__name__}: {e}"
+        return evidence
+
+    try:
+        if gateway_cli.is_macos():
+            path = gateway_cli.get_launchd_plist_path()
+            evidence.update({
+                "manager": "launchd",
+                "label": gateway_cli.get_launchd_label(),
+                "path": str(path),
+                "installed": path.exists(),
+                "running": gateway_cli._probe_launchd_service_running(),
+            })
+            if path.exists():
+                try:
+                    data = plistlib.loads(path.read_bytes())
+                except Exception as e:
+                    evidence["parse_error"] = f"{type(e).__name__}: {e}"
+                else:
+                    env = data.get("EnvironmentVariables") or {}
+                    evidence["service_home"] = str(env.get("HERMES_HOME") or "")
+                    evidence["working_directory"] = str(data.get("WorkingDirectory") or "")
+                    evidence["program"] = " ".join(
+                        str(item) for item in (data.get("ProgramArguments") or [])
+                    )
+            return evidence
+
+        if gateway_cli.supports_systemd_services():
+            user_path = gateway_cli.get_systemd_unit_path(system=False)
+            system_path = gateway_cli.get_systemd_unit_path(system=True)
+            system_scope = system_path.exists() and not user_path.exists()
+            path = system_path if system_scope else user_path
+            evidence.update({
+                "manager": "systemd",
+                "scope": "system" if system_scope else "user",
+                "name": gateway_cli.get_service_name(),
+                "path": str(path),
+                "installed": path.exists(),
+            })
+            if path.exists():
+                text = path.read_text(encoding="utf-8", errors="replace")
+                env = _parse_systemd_environment(text)
+                evidence["service_home"] = env.get("HERMES_HOME", "")
+                evidence["working_directory"] = _parse_systemd_value(text, "WorkingDirectory")
+                evidence["program"] = _parse_systemd_value(text, "ExecStart")
+                try:
+                    result = gateway_cli._run_systemctl(
+                        ["is-active", gateway_cli.get_service_name()],
+                        system=system_scope,
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                    evidence["running"] = result.stdout.strip() == "active"
+                except Exception as e:
+                    evidence["running_error"] = f"{type(e).__name__}: {e}"
+            return evidence
+
+        if gateway_cli.is_windows():
+            evidence["manager"] = "windows"
+            try:
+                from hermes_cli import gateway_windows  # type: ignore
+
+                evidence["installed"] = gateway_windows.is_installed()
+                evidence["running"] = bool(gateway_cli.find_gateway_pids())
+            except Exception as e:
+                evidence["error"] = f"{type(e).__name__}: {e}"
+            return evidence
+    except Exception as e:
+        evidence["error"] = f"{type(e).__name__}: {e}"
+    return evidence
+
+
+def _fail_if_service_home_mismatch(
+    ctx: _PhotonSetupContext,
+    service: dict[str, Any],
+) -> None:
+    service_home = str(service.get("service_home") or "").strip()
+    if not service_home:
+        return
+    expected = _canonical_path_str(ctx.hermes_home)
+    observed = _canonical_path_str(service_home)
+    if observed == expected:
+        return
+    raise _failed_invariant(
+        ctx,
+        step="gateway service identity",
+        summary="installed gateway service points at another Hermes home",
+        expected=f"service HERMES_HOME={expected}",
+        observed={
+            "service_home": observed,
+            "current_home": expected,
+            "service": service,
+        },
+        repair="repair or reinstall the gateway service for the current Hermes home; quick-setup will not mutate another home",
+    )
+
+
+def _parse_systemd_environment(text: str) -> dict[str, str]:
+    parsed: dict[str, str] = {}
+    for line in text.splitlines():
+        if not line.startswith("Environment="):
+            continue
+        body = line[len("Environment="):].strip()
+        try:
+            parts = shlex.split(body)
+        except ValueError:
+            parts = body.replace('"', "").split()
+        for item in parts:
+            if "=" not in item:
+                continue
+            key, value = item.split("=", 1)
+            parsed[key] = value
+    return parsed
+
+
+def _parse_systemd_value(text: str, key: str) -> str:
+    prefix = key + "="
+    for line in text.splitlines():
+        if line.startswith(prefix):
+            return line[len(prefix):].strip()
+    return ""
+
+
+def _inspect_gateway_runtime() -> dict[str, Any]:
+    try:
+        from gateway import status as gateway_status  # type: ignore
+
+        pid = gateway_status.get_running_pid(cleanup_stale=False)
+        runtime = gateway_status.read_runtime_status() or {}
+        return {
+            "running": pid is not None,
+            "pid": pid,
+            "status_path": str(gateway_status._get_runtime_status_path()),
+            "status": runtime,
+        }
+    except Exception as e:
+        return {
+            "running": False,
+            "pid": None,
+            "status_path": "",
+            "status": {},
+            "error": f"{type(e).__name__}: {e}",
+        }
+
+
+def _port_owner(port: int) -> dict[str, Any]:
+    evidence: dict[str, Any] = {"present": False, "port": port}
+    if os.name == "posix" and shutil.which("lsof"):
+        try:
+            proc = subprocess.run(  # noqa: S603
+                ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=2,
+            )
+        except (OSError, subprocess.TimeoutExpired) as e:
+            evidence["error"] = f"{type(e).__name__}: {e}"
+        else:
+            lines = [line for line in (proc.stdout or "").splitlines() if line.strip()]
+            if len(lines) >= 2:
+                parts = lines[1].split()
+                evidence.update({
+                    "present": True,
+                    "command": parts[0] if len(parts) > 0 else "",
+                    "pid": parts[1] if len(parts) > 1 else "",
+                    "user": parts[2] if len(parts) > 2 else "",
+                    "raw": lines[1],
+                })
+                return evidence
+
+    # Fallback detects a listener even when owner metadata is unavailable.
+    import socket
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(0.3)
+    try:
+        evidence["present"] = sock.connect_ex(("127.0.0.1", port)) == 0
+        if evidence["present"]:
+            evidence["detail"] = "listener present; owner unavailable"
+    except OSError as e:
+        evidence["error"] = f"{type(e).__name__}: {e}"
+    finally:
+        sock.close()
+    return evidence
+
+
+def _check_local_health(ctx: _PhotonSetupContext, timeout_seconds: float = 2.0) -> _HealthResult:
+    url = _local_health_url(ctx)
+    try:
+        with urllib.request.urlopen(url, timeout=timeout_seconds) as response:  # noqa: S310
+            body = response.read(64).decode("utf-8", errors="replace").strip()
+            status = int(getattr(response, "status", 0) or 0)
+            if 200 <= status < 300 and body == "ok":
+                return _HealthResult(True, url, "ok", status=status)
+            return _HealthResult(False, url, f"HTTP {status}, body={body!r}", status=status)
+    except urllib.error.HTTPError as e:
+        return _HealthResult(False, url, f"HTTP Error {e.code}: {e.reason}", status=e.code)
+    except Exception as e:
+        return _HealthResult(False, url, f"{type(e).__name__}: {e}")
+
+
+def _local_health_url(ctx: _PhotonSetupContext) -> str:
+    return f"http://127.0.0.1:{ctx.webhook_port}/healthz"
+
+
+def _health_evidence(health: Optional[_HealthResult]) -> dict[str, Any]:
+    if health is None:
+        return {"ok": False, "detail": "not checked"}
+    return {
+        "ok": health.ok,
+        "url": health.url,
+        "detail": health.detail,
+        "status": health.status,
+    }
+
+
+def _public_health_evidence(
+    health: Optional[tuple[bool, str]],
+) -> dict[str, Any]:
+    if health is None:
+        return {"ok": False, "detail": "not checked"}
+    return {"ok": bool(health[0]), "detail": health[1]}
+
+
+def _canonical_path_str(value: Any) -> str:
+    try:
+        return str(Path(str(value)).expanduser().resolve())
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return str(Path(str(value)).expanduser().absolute())
+
+
+def _failed_invariant(
+    ctx: _PhotonSetupContext,
+    *,
+    step: str,
+    summary: str,
+    expected: str,
+    observed: Any,
+    repair: str,
+    evidence: Optional[dict[str, Any]] = None,
+) -> _FailedInvariant:
+    merged: dict[str, Any] = {
+        "hermes_home": str(ctx.hermes_home),
+        "env_path": str(ctx.env_path),
+        "webhook_port": ctx.webhook_port,
+        "webhook_path": ctx.webhook_path,
+    }
+    if ctx.project_id:
+        merged["project_id"] = ctx.project_id
+    if ctx.webhook_url:
+        merged["webhook_url"] = ctx.webhook_url
+    if evidence:
+        merged.update(evidence)
+    return _FailedInvariant(
+        step=step,
+        summary=summary,
+        expected=expected,
+        observed=observed,
+        evidence=merged,
+        repair=repair,
+    )
+
+
+def _print_failed_invariant(error: _FailedInvariant) -> None:
+    print("", file=sys.stderr)
+    print(f"Photon quick setup stopped: {error.summary}", file=sys.stderr)
+    print(f"  step     : {error.step}", file=sys.stderr)
+    print(f"  expected : {error.expected}", file=sys.stderr)
+    print("  observed :", file=sys.stderr)
+    _print_evidence_value(error.observed, indent="    ", stream=sys.stderr)
+    print("  evidence :", file=sys.stderr)
+    _print_evidence_value(error.evidence, indent="    ", stream=sys.stderr)
+    print(f"  repair   : {error.repair}", file=sys.stderr)
+    if error.logs:
+        print("  relevant logs :", file=sys.stderr)
+        for label, lines in error.logs.items():
+            print(f"    [{label}]", file=sys.stderr)
+            for line in lines[-40:]:
+                print(f"      {line}", file=sys.stderr)
+
+
+def _print_evidence_value(value: Any, *, indent: str, stream: Any) -> None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if isinstance(item, (dict, list, tuple)):
+                print(f"{indent}{key}:", file=stream)
+                _print_evidence_value(item, indent=indent + "  ", stream=stream)
+            else:
+                print(f"{indent}{key}: {item}", file=stream)
+        return
+    if isinstance(value, (list, tuple)):
+        if not value:
+            print(f"{indent}-", file=stream)
+            return
+        for item in value:
+            if isinstance(item, (dict, list, tuple)):
+                print(f"{indent}-", file=stream)
+                _print_evidence_value(item, indent=indent + "  ", stream=stream)
+            else:
+                print(f"{indent}- {item}", file=stream)
+        return
+    print(f"{indent}{value}", file=stream)
+
+
+def _print_quick_setup_reconciled(ctx: _PhotonSetupContext) -> None:
+    print("Photon quick setup complete.")
+    print(f"  Hermes home       : {ctx.hermes_home}")
+    print(f"  env path          : {ctx.env_path}")
+    print(f"  project id        : {ctx.project_id}")
+    print(
+        "  local health      : "
+        + (
+            f"ok ({ctx.local_health.url})"
+            if ctx.local_health and ctx.local_health.ok
+            else "not verified"
+        )
+    )
+    print(
+        "  public health     : "
+        + (
+            f"ok ({ctx.public_health[1]})"
+            if ctx.public_health and ctx.public_health[0]
+            else "not verified"
+        )
+    )
+    print(f"  webhook URL       : {ctx.webhook_url}")
+    print("  gateway runtime   : photon=connected")
+    _print_text_photon_number_step(ctx.outcome())
 
 
 def interactive_setup() -> None:
@@ -279,13 +1751,11 @@ def _interactive_setup_already_configured() -> bool:
 
 
 def print_login_first_guidance() -> None:
-    """Explain the required login-before-quick-setup order."""
+    """Explain the primary quick-setup entrypoint."""
     print()
-    print("Photon quick setup needs a Photon login first.")
-    print("  First:")
-    print("        hermes photon login")
-    print("  Then:")
+    print("Run Photon quick setup:")
     print(f"        hermes photon quick-setup --phone {_PHONE_ARG_PLACEHOLDER}")
+    print("It will validate or run Photon login before reconciling runtime state.")
 
 
 def print_incomplete_setup_guidance() -> None:
@@ -297,9 +1767,7 @@ def print_incomplete_setup_guidance() -> None:
         not photon_auth.load_photon_token()
         and not (project_id and project_secret)
     ):
-        print("  First:")
-        print("        hermes photon login")
-        print("  Then:")
+        print("  Guided setup:")
         print(f"        hermes photon quick-setup --phone {_PHONE_ARG_PLACEHOLDER}")
     else:
         print("  Guided setup:")
@@ -414,7 +1882,7 @@ def _run_base_setup(args: argparse.Namespace, *, total_steps: int) -> _SetupOutc
 
 
 def _setup_project_name(args: argparse.Namespace) -> str:
-    return args.project_name or "Hermes Agent"
+    return getattr(args, "project_name", None) or "Hermes Agent"
 
 
 def _dashboard_url() -> str:
@@ -452,10 +1920,6 @@ def _candidate_user_payloads(user: Any) -> list[dict[str, Any]]:
 
 def _print_quick_setup_complete(outcome: _SetupOutcome) -> None:
     print("Photon quick setup complete.")
-    print("  Start Hermes gateway in foreground QA mode:")
-    print("        hermes gateway run -v")
-    print("  If the gateway is already running:")
-    print("        hermes gateway restart")
     _print_text_photon_number_step(outcome)
     print("  Verify setup if needed:")
     print("        hermes photon status")
@@ -756,6 +2220,7 @@ def _project_summary(project: dict[str, Any]) -> str:
 
 
 def _cmd_status(_args: argparse.Namespace) -> int:
+    ctx = _PhotonSetupContext.from_args(_args)
     # Defer the whole table to auth.print_credential_summary — its emit
     # callback is the only sink that sees credential-derived strings, so
     # cli.py keeps zero taint flow according to CodeQL.
@@ -770,15 +2235,31 @@ def _cmd_status(_args: argparse.Namespace) -> int:
     project_id, project_secret = photon_auth.load_project_credentials()
     registered_hooks: Optional[list] = None
     registered_error = ""
+    spectrum_status = "✗ missing Photon project credentials"
     if project_id and project_secret:
         try:
             registered_hooks = photon_auth.list_webhooks(project_id, project_secret)
+            spectrum_status = "✓ valid"
         except Exception as e:
             registered_error = str(e)
+            status = _http_status(e)
+            if status:
+                spectrum_status = f"✗ invalid or unreachable (HTTP {status})"
+            else:
+                spectrum_status = f"✗ invalid or unreachable ({_short_error(str(e))})"
     else:
         registered_error = "missing Photon project credentials"
+    service_identity = _inspect_gateway_service_identity(ctx)
+    runtime_status = _inspect_gateway_runtime()
+    local_health = _check_local_health(ctx)
     print(f"  Hermes home         : {photon_tunnel.hermes_home()}")
+    print(f"  env path            : {ctx.env_path}")
+    print(f"  dashboard auth      : {_dashboard_token_status()}")
+    print(f"  Spectrum creds      : {spectrum_status}")
     print(f"  Photon owner        : {_active_home_status()}")
+    print(f"  gateway service     : {_format_service_identity(service_identity)}")
+    print(f"  gateway runtime     : {_format_runtime_status(runtime_status)}")
+    print(f"  local health        : {_format_local_health_status(local_health)}")
     print(f"  node binary         : {node_bin or '✗ missing (install Node 20.18.1+)'}")
     print(f"  sidecar deps        : {sidecar_status}")
     print(f"  authorized phones   : {_photon_sender_access_status()}")
@@ -792,8 +2273,10 @@ def _cmd_status(_args: argparse.Namespace) -> int:
         )
     )
     print(f"  managed tunnel      : {tunnel_label}")
+    public_health: Optional[tuple[bool, str]] = None
     if isinstance(public_url, str) and public_url.startswith("http"):
-        healthy, detail = photon_tunnel.check_public_health(public_url)
+        healthy, detail = _check_public_health_for_status(public_url)
+        public_health = (healthy, detail)
         health_label = f"✓ reachable ({detail})" if healthy else f"✗ unreachable ({detail})"
         print(f"  public health       : {health_label}")
     print(
@@ -803,6 +2286,9 @@ def _cmd_status(_args: argparse.Namespace) -> int:
             tunnel_state,
             registered_hooks=registered_hooks,
             registered_error=registered_error,
+            public_health=public_health,
+            local_health=local_health,
+            service_identity=service_identity,
         )
     )
     print(f"  docs                : {_docs_paths()}")
@@ -1595,6 +3081,60 @@ def _format_tunnel_status(state: dict[str, Any]) -> str:
     return "✗ not started"
 
 
+def _dashboard_token_status() -> str:
+    token = photon_auth.load_photon_token()
+    if not token:
+        return "✗ missing"
+    try:
+        photon_auth.validate_photon_token(token)
+    except Exception as e:
+        return f"✗ invalid ({_short_error(str(e))})"
+    return "✓ valid"
+
+
+def _format_service_identity(service: dict[str, Any]) -> str:
+    manager = service.get("manager") or "manual"
+    if not service.get("installed"):
+        return f"not installed ({manager})"
+    parts = [f"{manager} installed"]
+    if service.get("running"):
+        parts.append("running")
+    else:
+        parts.append("stopped")
+    service_home = str(service.get("service_home") or "").strip()
+    expected = str(service.get("expected_home") or "").strip()
+    if service_home:
+        if expected and _canonical_path_str(service_home) != _canonical_path_str(expected):
+            parts.append(f"wrong home: {service_home}")
+        else:
+            parts.append(f"home={service_home}")
+    if service.get("path"):
+        parts.append(f"path={service.get('path')}")
+    return "; ".join(parts)
+
+
+def _format_runtime_status(runtime: dict[str, Any]) -> str:
+    if not runtime.get("running"):
+        return "✗ not running for this Hermes home"
+    status = runtime.get("status") or {}
+    photon_state = (
+        status.get("platforms", {})
+        .get("photon", {})
+        .get("state")
+    )
+    runtime_project_id = _runtime_photon_project_id(runtime)
+    project_detail = f"; project={runtime_project_id}" if runtime_project_id else ""
+    if photon_state:
+        return f"pid {runtime.get('pid')}; photon={photon_state}{project_detail}"
+    return f"pid {runtime.get('pid')}; photon=unknown{project_detail}"
+
+
+def _format_local_health_status(health: _HealthResult) -> str:
+    if health.ok:
+        return f"✓ reachable ({health.url})"
+    return f"✗ unreachable ({health.detail})"
+
+
 def _active_home_status() -> str:
     record = photon_tunnel.active_home_record()
     owner = str(record.get("hermes_home") or "").strip()
@@ -1613,6 +3153,9 @@ def _next_status_step(
     *,
     registered_hooks: Optional[list] = None,
     registered_error: str = "",
+    public_health: Optional[tuple[bool, str]] = None,
+    local_health: Optional[_HealthResult] = None,
+    service_identity: Optional[dict[str, Any]] = None,
 ) -> str:
     if photon_tunnel.active_home_mismatch():
         return (
@@ -1637,12 +3180,28 @@ def _next_status_step(
         )
         if not current_registered:
             return "hermes photon webhook tunnel start"
+        public_health_step = _public_health_next_step(
+            public_health,
+            tunnel_state,
+            public_url,
+            local_health=local_health,
+            service_identity=service_identity,
+        )
+        if public_health_step:
+            return public_health_step
         if _stale_managed_webhooks(registered_hooks, keep_url=public_url, owned=True):
             return "hermes photon webhook tunnel start  (cleans owned stale managed webhooks)"
-        if _stale_managed_webhooks(registered_hooks, keep_url=public_url, owned=False):
-            return "hermes photon webhook list  (delete unowned stale managed webhooks manually)"
     elif registered_error:
         pass
+    public_health_step = _public_health_next_step(
+        public_health,
+        tunnel_state,
+        public_url,
+        local_health=local_health,
+        service_identity=service_identity,
+    )
+    if public_health_step:
+        return public_health_step
     if not _photon_sender_access_configured():
         return f"hermes photon allow-phone {_PHONE_ARG_PLACEHOLDER}"
     try:
@@ -1661,6 +3220,72 @@ def _next_status_step(
     except Exception:
         pass
     return "hermes gateway run -v  (or `hermes gateway restart` if already running)"
+
+
+def _public_health_next_step(
+    public_health: Optional[tuple[bool, str]],
+    tunnel_state: dict[str, Any],
+    public_url: str,
+    *,
+    local_health: Optional[_HealthResult] = None,
+    service_identity: Optional[dict[str, Any]] = None,
+) -> Optional[str]:
+    if not public_health:
+        return None
+    healthy, detail = public_health
+    if healthy:
+        return None
+
+    detail_lower = (detail or "").lower()
+    managed_quick_tunnel = photon_tunnel.is_trycloudflare_url(public_url)
+    if managed_quick_tunnel and (
+        "nodename nor servname" in detail_lower
+        or "name or service not known" in detail_lower
+        or "no address associated" in detail_lower
+        or "http error 530" in detail_lower
+    ):
+        return (
+            "hermes photon webhook tunnel stop && "
+            "hermes photon webhook tunnel start"
+        )
+
+    if not tunnel_state.get("running"):
+        if managed_quick_tunnel:
+            return "hermes photon webhook tunnel start"
+        return "repair the public webhook URL, then run `hermes photon webhook register ...`"
+
+    if (
+        "http error 502" in detail_lower
+        or "bad gateway" in detail_lower
+        or "connection refused" in detail_lower
+        or "connection reset" in detail_lower
+        or "timed out" in detail_lower
+    ):
+        if local_health is not None and not local_health.ok:
+            if service_identity and "wrong home" in _format_service_identity(service_identity):
+                return "repair the gateway service HERMES_HOME for this profile"
+            return "start or repair the current-home gateway; local health is failing"
+        return "hermes gateway restart  (then re-run `hermes photon status`)"
+
+    return "hermes photon status  (retry; if still unreachable, run `hermes gateway restart`)"
+
+
+def _check_public_health_for_status(public_url: str) -> tuple[bool, str]:
+    healthy, detail = photon_tunnel.check_public_health(public_url)
+    if healthy or not _public_health_can_be_transient(detail):
+        return healthy, detail
+
+    for _attempt in range(2):
+        time.sleep(2)
+        healthy, detail = photon_tunnel.check_public_health(public_url)
+        if healthy or not _public_health_can_be_transient(detail):
+            return healthy, detail
+    return healthy, detail
+
+
+def _public_health_can_be_transient(detail: str) -> bool:
+    detail_lower = (detail or "").lower()
+    return "http error 502" in detail_lower or "bad gateway" in detail_lower
 
 
 def _docs_paths() -> str:

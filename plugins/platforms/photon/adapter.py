@@ -396,6 +396,7 @@ class PhotonAdapter(BasePlatformAdapter):
                 retryable=False,
             )
             return False
+        self._write_runtime_project_metadata()
 
         mismatch = photon_tunnel.active_home_mismatch()
         if mismatch:
@@ -467,12 +468,29 @@ class PhotonAdapter(BasePlatformAdapter):
 
         self._http_client = httpx.AsyncClient(timeout=30.0)
         self._mark_connected()
+        self._write_runtime_project_metadata()
         logger.info(
             "[photon] connected — webhook at %s:%d%s, sidecar on %s:%d",
             self._webhook_bind, self._webhook_port, self._webhook_path,
             self._sidecar_bind, self._sidecar_port,
         )
         return True
+
+    def _write_runtime_project_metadata(self) -> None:
+        try:
+            from gateway.status import write_runtime_status
+
+            write_runtime_status(
+                platform="photon",
+                platform_metadata={
+                    "project_id": self._project_id,
+                    "webhook_port": self._webhook_port,
+                    "webhook_path": self._webhook_path,
+                    "webhook_public_url": self._webhook_public_url,
+                },
+            )
+        except Exception:
+            pass
 
     async def disconnect(self) -> None:
         await self._stop_sidecar()
