@@ -157,3 +157,102 @@ def test_interactive_setup_runs_quick_setup_when_reconfigure_confirmed(
     photon_cli.interactive_setup()
 
     assert calls == [True]
+
+
+def _hook(webhook_id: str, url: str) -> dict[str, str]:
+    return {"id": webhook_id, "webhookUrl": url}
+
+
+def test_registered_webhook_status_splits_owned_and_unowned_stale(
+    monkeypatch: Any,
+) -> None:
+    current_url = "https://current.trycloudflare.com/photon/webhook"
+    hooks = [
+        _hook("current", current_url),
+        _hook("owned-stale", "https://owned-old.trycloudflare.com/photon/webhook"),
+        _hook("unowned-stale", "https://foreign-old.trycloudflare.com/photon/webhook"),
+    ]
+    monkeypatch.setattr(
+        photon_cli.photon_tunnel,
+        "owned_webhook_ids",
+        lambda: {"owned-stale"},
+    )
+
+    status = photon_cli._format_registered_webhook_status(
+        hooks,
+        "",
+        current_url,
+    )
+
+    assert "current URL registered" in status
+    assert "1 owned stale managed" in status
+    assert "1 unowned stale managed" in status
+
+
+def _stub_ready_next_step_dependencies(
+    monkeypatch: Any,
+    *,
+    public_url: str,
+) -> None:
+    monkeypatch.setattr(
+        photon_cli.photon_tunnel,
+        "active_home_mismatch",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        photon_cli.photon_auth,
+        "load_project_credentials",
+        lambda: ("pid", "secret"),
+    )
+    monkeypatch.setattr(photon_cli.photon_auth, "load_photon_token", lambda: "token")
+    monkeypatch.setattr(photon_cli, "_webhook_secret_present", lambda: True)
+    monkeypatch.setattr(
+        photon_cli,
+        "_get_env_value",
+        lambda key: public_url if key == "PHOTON_WEBHOOK_PUBLIC_URL" else None,
+    )
+    monkeypatch.setattr(photon_cli, "_photon_sender_access_configured", lambda: True)
+
+
+def test_next_step_cleans_owned_stale_managed_webhooks(
+    monkeypatch: Any,
+) -> None:
+    current_url = "https://current.trycloudflare.com/photon/webhook"
+    hooks = [
+        _hook("current", current_url),
+        _hook("owned-stale", "https://owned-old.trycloudflare.com/photon/webhook"),
+    ]
+    _stub_ready_next_step_dependencies(monkeypatch, public_url=current_url)
+    monkeypatch.setattr(
+        photon_cli.photon_tunnel,
+        "owned_webhook_ids",
+        lambda: {"owned-stale"},
+    )
+
+    step = photon_cli._next_status_step(
+        "✓ installed",
+        {"running": True},
+        registered_hooks=hooks,
+    )
+
+    assert step == "hermes photon webhook tunnel start  (cleans owned stale managed webhooks)"
+
+
+def test_next_step_does_not_claim_unowned_stale_cleanup(
+    monkeypatch: Any,
+) -> None:
+    current_url = "https://current.trycloudflare.com/photon/webhook"
+    hooks = [
+        _hook("current", current_url),
+        _hook("unowned-stale", "https://foreign-old.trycloudflare.com/photon/webhook"),
+    ]
+    _stub_ready_next_step_dependencies(monkeypatch, public_url=current_url)
+    monkeypatch.setattr(photon_cli.photon_tunnel, "owned_webhook_ids", lambda: set())
+
+    step = photon_cli._next_status_step(
+        "✓ installed",
+        {"running": True},
+        registered_hooks=hooks,
+    )
+
+    assert step == "hermes photon webhook list  (delete unowned stale managed webhooks manually)"

@@ -218,8 +218,8 @@ def check_public_health(webhook_url: str, timeout_seconds: float = 5.0) -> tuple
 
 
 def parse_quick_tunnel_url(text: str) -> str:
-    match = _TRYCLOUDFLARE_RE.search(text or "")
-    return match.group(0) if match else ""
+    matches = _TRYCLOUDFLARE_RE.findall(text or "")
+    return matches[-1] if matches else ""
 
 
 def is_trycloudflare_url(url: str) -> bool:
@@ -649,6 +649,15 @@ def resolve_cloudflared_binary(
     return install_managed_cloudflared(emit=emit)
 
 
+def _read_log_from_offset(path: Path, offset: int) -> str:
+    try:
+        with path.open("rb") as fh:
+            fh.seek(max(0, offset))
+            return fh.read().decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
 def start(
     timeout_seconds: float = DEFAULT_START_TIMEOUT_SECONDS,
     *,
@@ -690,6 +699,10 @@ def start(
     directory.mkdir(parents=True, exist_ok=True)
     command = _cloudflared_command(binary)
     log_file = log_path()
+    try:
+        attempt_log_offset = log_file.stat().st_size
+    except OSError:
+        attempt_log_offset = 0
     with log_file.open("a", encoding="utf-8") as fh:
         fh.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] starting: {' '.join(command)}\n")
         fh.flush()
@@ -705,10 +718,7 @@ def start(
     deadline = time.monotonic() + timeout_seconds
     public_url = ""
     while time.monotonic() < deadline:
-        try:
-            text = log_file.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            text = ""
+        text = _read_log_from_offset(log_file, attempt_log_offset)
         public_url = parse_quick_tunnel_url(text)
         if public_url:
             break

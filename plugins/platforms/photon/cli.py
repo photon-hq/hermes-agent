@@ -1529,26 +1529,58 @@ def _format_registered_webhook_status(
     current_registered = bool(
         current_url and any(_webhook_url(hook) == current_url for hook in hooks)
     )
-    stale_managed = len(_stale_managed_webhooks(hooks, keep_url=current_url))
+    owned_stale = len(_stale_managed_webhooks(hooks, keep_url=current_url, owned=True))
+    unowned_stale = len(_stale_managed_webhooks(hooks, keep_url=current_url, owned=False))
+    stale_detail = _format_stale_managed_detail(
+        owned_stale=owned_stale,
+        unowned_stale=unowned_stale,
+    )
     count = len(hooks)
-    if current_url and current_registered and stale_managed:
-        return f"⚠ {count} registered; current URL registered; {stale_managed} stale managed"
     if current_url and current_registered:
+        if stale_detail:
+            return f"⚠ {count} registered; current URL registered; {stale_detail}"
         return f"✓ {count} registered; current URL registered"
     if current_url:
+        if stale_detail:
+            return f"✗ {count} registered; current URL is not registered; {stale_detail}"
         return f"✗ {count} registered; current URL is not registered"
-    if stale_managed:
-        return f"⚠ {count} registered; {stale_managed} stale managed"
+    if stale_detail:
+        return f"⚠ {count} registered; {stale_detail}"
     return f"✓ {count} registered"
 
 
-def _stale_managed_webhooks(hooks: list, *, keep_url: str) -> list:
-    return [
-        hook for hook in hooks
-        if _webhook_url(hook)
-        and _webhook_url(hook) != keep_url
-        and photon_tunnel.is_trycloudflare_url(_webhook_url(hook))
-    ]
+def _format_stale_managed_detail(*, owned_stale: int, unowned_stale: int) -> str:
+    parts = []
+    if owned_stale:
+        parts.append(f"{owned_stale} owned stale managed")
+    if unowned_stale:
+        parts.append(f"{unowned_stale} unowned stale managed")
+    return "; ".join(parts)
+
+
+def _stale_managed_webhooks(
+    hooks: list,
+    *,
+    keep_url: str,
+    owned: Optional[bool] = None,
+) -> list:
+    owned_ids = photon_tunnel.owned_webhook_ids()
+    stale_hooks = []
+    for hook in hooks:
+        url = _webhook_url(hook)
+        if (
+            not url
+            or url == keep_url
+            or not photon_tunnel.is_trycloudflare_url(url)
+        ):
+            continue
+        is_owned = _webhook_id(hook) in owned_ids
+        if owned is True and not is_owned:
+            continue
+        if owned is False and is_owned:
+            continue
+        stale_hooks.append(hook)
+    return stale_hooks
 
 
 def _short_error(error: str) -> str:
@@ -1605,8 +1637,10 @@ def _next_status_step(
         )
         if not current_registered:
             return "hermes photon webhook tunnel start"
-        if _stale_managed_webhooks(registered_hooks, keep_url=public_url):
-            return "hermes photon webhook tunnel start  (cleans stale managed webhooks)"
+        if _stale_managed_webhooks(registered_hooks, keep_url=public_url, owned=True):
+            return "hermes photon webhook tunnel start  (cleans owned stale managed webhooks)"
+        if _stale_managed_webhooks(registered_hooks, keep_url=public_url, owned=False):
+            return "hermes photon webhook list  (delete unowned stale managed webhooks manually)"
     elif registered_error:
         pass
     if not _photon_sender_access_configured():
