@@ -17,7 +17,7 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 
-from gateway.status import terminate_pid, terminate_process_tree
+from gateway.status import terminate_pid
 from gateway.restart import (
     DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
     GATEWAY_SERVICE_RESTART_EXIT_CODE,
@@ -3032,11 +3032,8 @@ def _wait_for_gateway_exit(timeout: float = 10.0, force_after: float | None = 5.
         if force_after is not None and not force_sent and time.monotonic() >= force_deadline:
             # Grace period expired — force-kill the specific PID.
             try:
-                terminate_process_tree(pid, force=True)
-                print(
-                    f"⚠ Gateway PID {pid} did not exit gracefully; "
-                    "sent SIGKILL to its process tree"
-                )
+                terminate_pid(pid, force=True)
+                print(f"⚠ Gateway PID {pid} did not exit gracefully; sent SIGKILL")
             except (ProcessLookupError, PermissionError, OSError):
                 return True  # Already gone or we can't touch it.
             force_sent = True

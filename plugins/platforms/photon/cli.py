@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import argparse
 import getpass
-import hashlib
 import json
 import os
 import plistlib
@@ -44,7 +43,6 @@ _DEFAULT_SIDECAR_PORT = 8789
 _DEFAULT_SIDECAR_BIND = "127.0.0.1"
 _PHONE_FORMAT = "+<country-code><number>"
 _PHONE_ARG_PLACEHOLDER = f"'{_PHONE_FORMAT}'"
-_FINGERPRINT_VERSION = "sha256:16"
 _PHOTON_RUNTIME_RESET_ENV_KEYS = (
     "PHOTON_PROJECT_ID",
     "PHOTON_PROJECT_SECRET",
@@ -555,22 +553,7 @@ def _run_quick_setup_reconciler(ctx: _PhotonSetupContext) -> None:
     )
     _ensure_photon_gateway_platform_enabled(ctx)
     _ensure_gateway_local_runtime(ctx)
-    identity_restarted = _reconcile_gateway_runtime_identity(
-        ctx,
-        require_webhook_secret=True,
-        reason="post-webhook runtime identity verification",
-    )
-    if identity_restarted:
-        _wait_for_local_health(
-            ctx,
-            reason="gateway restart after Photon runtime identity reconciliation",
-        )
-        _wait_for_public_health(
-            ctx,
-            reason="gateway restart after Photon runtime identity reconciliation",
-        )
-    else:
-        _wait_for_public_health(ctx, reason="post-webhook verification")
+    _wait_for_public_health(ctx, reason="post-webhook verification")
     _wait_for_photon_connected(ctx)
 
 
@@ -1073,18 +1056,6 @@ def _ensure_gateway_local_runtime(ctx: _PhotonSetupContext) -> None:
         announce=True,
     )
     runtime = _inspect_gateway_runtime()
-    if runtime.get("running"):
-        restarted = _reconcile_gateway_runtime_identity(
-            ctx,
-            require_webhook_secret=False,
-            reason="pre-health runtime identity verification",
-        )
-        if restarted:
-            _wait_for_local_health(
-                ctx,
-                reason="gateway restart after Photon runtime identity reconciliation",
-            )
-            return
     local = _check_local_health(ctx)
     ctx.local_health = local
     if local.ok and runtime.get("running"):
@@ -1119,11 +1090,6 @@ def _ensure_gateway_local_runtime(ctx: _PhotonSetupContext) -> None:
 
     _start_current_home_gateway(ctx, service)
     _wait_for_local_health(ctx, reason="gateway startup")
-    _wait_for_runtime_identity(
-        ctx,
-        require_webhook_secret=False,
-        reason="gateway startup",
-    )
 
 
 def _ensure_public_webhook_path(
@@ -1376,7 +1342,6 @@ def _wait_for_photon_connected(ctx: _PhotonSetupContext, timeout_seconds: float 
     last_status: dict[str, Any] = {}
     while time.monotonic() < deadline:
         runtime = _inspect_gateway_runtime()
-        _assert_runtime_project_matches(ctx, runtime)
         last_status = runtime
         photon_state = (
             (runtime.get("status") or {})
@@ -1385,23 +1350,6 @@ def _wait_for_photon_connected(ctx: _PhotonSetupContext, timeout_seconds: float 
             .get("state")
         )
         if photon_state == "connected":
-            comparison = _runtime_identity_comparison(
-                ctx,
-                runtime,
-                require_webhook_secret=True,
-            )
-            if not comparison.get("matches"):
-                raise _runtime_identity_failure(
-                    ctx,
-                    summary=(
-                        "gateway reported photon=connected with a stale "
-                        "Photon runtime identity"
-                    ),
-                    comparison=comparison,
-                    runtime=runtime,
-                    reason="final photon=connected verification",
-                    repair="restart or repair the current-home gateway, then rerun quick-setup",
-                )
             print("  ✓ gateway runtime reports photon=connected")
             return
         if photon_state == "fatal":
@@ -1662,275 +1610,6 @@ def _finalize_failed_invariant_logs(
         error.logs = _collect_relevant_log_tail(ctx)
 
 
-def _secret_fingerprint(value: str) -> str:
-    if not value:
-        return ""
-    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
-    return f"sha256:{digest}"
-
-
-def _expected_runtime_identity(
-    ctx: _PhotonSetupContext,
-    *,
-    require_webhook_secret: bool,
-) -> dict[str, str]:
-    expected = {
-        "project_id": ctx.project_id,
-        "project_secret_fingerprint": _secret_fingerprint(ctx.project_secret),
-    }
-    webhook_secret = (_get_env_value("PHOTON_WEBHOOK_SECRET") or "").strip()
-    if webhook_secret or require_webhook_secret:
-        expected["webhook_secret_fingerprint"] = _secret_fingerprint(webhook_secret)
-    return {
-        key: value
-        for key, value in expected.items()
-        if value or key == "webhook_secret_fingerprint"
-    }
-
-
-def _runtime_photon_field(runtime: dict[str, Any], *keys: str) -> str:
-    photon = _runtime_photon_status(runtime)
-    for key in keys:
-        value = photon.get(key)
-        if value:
-            return str(value)
-    metadata = photon.get("metadata")
-    if isinstance(metadata, dict):
-        for key in keys:
-            value = metadata.get(key)
-            if value:
-                return str(value)
-    return ""
-
-
-def _observed_runtime_identity(runtime: dict[str, Any]) -> dict[str, str]:
-    observed = {
-        "project_id": _runtime_photon_project_id(runtime),
-        "project_secret_fingerprint": _runtime_photon_field(
-            runtime,
-            "project_secret_fingerprint",
-            "projectSecretFingerprint",
-        ),
-        "webhook_secret_fingerprint": _runtime_photon_field(
-            runtime,
-            "webhook_secret_fingerprint",
-            "webhookSecretFingerprint",
-        ),
-        "credential_fingerprint_version": _runtime_photon_field(
-            runtime,
-            "credential_fingerprint_version",
-            "credentialFingerprintVersion",
-        ),
-    }
-    return {key: value for key, value in observed.items() if value}
-
-
-def _runtime_identity_comparison(
-    ctx: _PhotonSetupContext,
-    runtime: dict[str, Any],
-    *,
-    require_webhook_secret: bool,
-) -> dict[str, Any]:
-    expected = _expected_runtime_identity(
-        ctx,
-        require_webhook_secret=require_webhook_secret,
-    )
-    observed = _observed_runtime_identity(runtime)
-    missing_expected = [
-        key for key, value in expected.items()
-        if key.endswith("_fingerprint") and not value
-    ]
-    missing_observed = {
-        key: expected_value
-        for key, expected_value in expected.items()
-        if expected_value and not observed.get(key)
-    }
-    mismatches = {
-        key: {
-            "expected": expected_value,
-            "observed": observed.get(key, ""),
-        }
-        for key, expected_value in expected.items()
-        if expected_value
-        and observed.get(key)
-        and observed.get(key) != expected_value
-    }
-    return {
-        "expected": expected,
-        "observed": observed,
-        "missing_expected": missing_expected,
-        "missing_observed": missing_observed,
-        "mismatches": mismatches,
-        "matches": not missing_expected and not missing_observed and not mismatches,
-    }
-
-
-def _runtime_identity_has_stale_evidence(
-    comparison: dict[str, Any],
-    runtime: dict[str, Any],
-) -> bool:
-    if comparison.get("mismatches") or comparison.get("missing_expected"):
-        return True
-    if comparison.get("missing_observed") and _runtime_photon_status(runtime):
-        return True
-    status = runtime.get("status") or {}
-    if (
-        comparison.get("missing_observed")
-        and status.get("gateway_state") == "running"
-        and not _runtime_photon_status(runtime)
-    ):
-        return True
-    return False
-
-
-def _runtime_identity_failure(
-    ctx: _PhotonSetupContext,
-    *,
-    summary: str,
-    comparison: dict[str, Any],
-    runtime: dict[str, Any],
-    reason: str,
-    repair: str,
-) -> _FailedInvariant:
-    local = ctx.local_health or _check_local_health(ctx)
-    return _failed_invariant(
-        ctx,
-        step="gateway runtime identity",
-        summary=summary,
-        expected="gateway runtime Photon identity matches quick-setup validated env state",
-        observed={
-            "expected_runtime_identity": comparison.get("expected", {}),
-            "observed_runtime_identity": comparison.get("observed", {}),
-            "missing_expected": comparison.get("missing_expected", []),
-            "missing_observed": comparison.get("missing_observed", {}),
-            "mismatches": comparison.get("mismatches", {}),
-        },
-        evidence={
-            "reason": reason,
-            "fingerprint_version": _FINGERPRINT_VERSION,
-            "service": _inspect_gateway_service_identity(ctx),
-            "runtime": runtime,
-            "gateway_runtime_status_path": runtime.get("status_path", ""),
-            "local_health": _health_evidence(local),
-            "public_health": _public_health_evidence(ctx.public_health),
-            "port_owner": _port_owner(ctx.webhook_port),
-        },
-        repair=repair,
-    )
-
-
-def _wait_for_runtime_identity(
-    ctx: _PhotonSetupContext,
-    *,
-    require_webhook_secret: bool,
-    reason: str,
-    timeout_seconds: float = 60.0,
-) -> dict[str, Any]:
-    print("[runtime] Verifying gateway loaded reconciled Photon credentials...")
-    deadline = time.monotonic() + timeout_seconds
-    last_runtime: dict[str, Any] = {}
-    last_comparison: dict[str, Any] = {}
-    while time.monotonic() < deadline:
-        runtime = _inspect_gateway_runtime()
-        comparison = _runtime_identity_comparison(
-            ctx,
-            runtime,
-            require_webhook_secret=require_webhook_secret,
-        )
-        last_runtime = runtime
-        last_comparison = comparison
-        if comparison.get("matches"):
-            print("  ✓ gateway runtime identity matches reconciled Photon credentials")
-            return runtime
-        _stream_quick_setup_logs(ctx)
-        time.sleep(1)
-
-    raise _runtime_identity_failure(
-        ctx,
-        summary="gateway did not report the Photon identity quick-setup validated",
-        comparison=last_comparison,
-        runtime=last_runtime,
-        reason=reason,
-        repair="restart or repair the current-home gateway, then rerun quick-setup",
-    )
-
-
-def _reconcile_gateway_runtime_identity(
-    ctx: _PhotonSetupContext,
-    *,
-    require_webhook_secret: bool,
-    reason: str,
-    timeout_seconds: float = 60.0,
-) -> bool:
-    deadline = time.monotonic() + timeout_seconds
-    last_runtime = _inspect_gateway_runtime()
-    last_comparison = _runtime_identity_comparison(
-        ctx,
-        last_runtime,
-        require_webhook_secret=require_webhook_secret,
-    )
-    while time.monotonic() < deadline:
-        if last_comparison.get("matches"):
-            return False
-        if last_runtime.get("running") and _runtime_identity_has_stale_evidence(
-            last_comparison,
-            last_runtime,
-        ):
-            break
-        _stream_quick_setup_logs(ctx)
-        time.sleep(1)
-        last_runtime = _inspect_gateway_runtime()
-        last_comparison = _runtime_identity_comparison(
-            ctx,
-            last_runtime,
-            require_webhook_secret=require_webhook_secret,
-        )
-
-    if not last_runtime.get("running"):
-        raise _runtime_identity_failure(
-            ctx,
-            summary=(
-                "gateway runtime identity could not be verified because the "
-                "gateway is not running"
-            ),
-            comparison=last_comparison,
-            runtime=last_runtime,
-            reason=reason,
-            repair="start the current-home gateway, then rerun quick-setup",
-        )
-
-    _restart_current_home_gateway(ctx)
-    try:
-        _wait_for_runtime_identity(
-            ctx,
-            require_webhook_secret=require_webhook_secret,
-            reason=f"{reason}; restart after stale Photon runtime identity",
-            timeout_seconds=timeout_seconds,
-        )
-    except _FailedInvariant as exc:
-        after_runtime = _inspect_gateway_runtime()
-        after_comparison = _runtime_identity_comparison(
-            ctx,
-            after_runtime,
-            require_webhook_secret=require_webhook_secret,
-        )
-        raise _runtime_identity_failure(
-            ctx,
-            summary=(
-                "gateway restarted but still did not load reconciled Photon "
-                "runtime identity"
-            ),
-            comparison=after_comparison,
-            runtime=after_runtime,
-            reason=reason,
-            repair=(
-                "inspect the current-home gateway service environment and "
-                "Photon .env, then rerun quick-setup"
-            ),
-        ) from exc
-    return True
-
-
 def _runtime_photon_status(runtime: dict[str, Any]) -> dict[str, Any]:
     status = runtime.get("status") or {}
     platforms = status.get("platforms") or {}
@@ -1965,36 +1644,6 @@ def _project_id_from_text(text: str) -> str:
         text or "",
     )
     return match.group(1) if match else ""
-
-
-def _assert_runtime_project_matches(
-    ctx: _PhotonSetupContext,
-    runtime: dict[str, Any],
-) -> None:
-    if not ctx.project_id:
-        return
-    runtime_project_id = _runtime_photon_project_id(runtime)
-    if not runtime_project_id or runtime_project_id == ctx.project_id:
-        return
-    raise _failed_invariant(
-        ctx,
-        step="gateway runtime project identity",
-        summary="gateway loaded a different Photon project than quick-setup validated",
-        expected=f"gateway Photon project id {ctx.project_id}",
-        observed={
-            "setup_project_id": ctx.project_id,
-            "gateway_project_id": runtime_project_id,
-        },
-        evidence={
-            "runtime": runtime,
-            "service": _inspect_gateway_service_identity(ctx),
-            "log_paths": {
-                label: str(path)
-                for label, path in _quick_setup_log_paths(ctx).items()
-            },
-        },
-        repair="restart the current-home gateway so it reloads the reconciled Photon env state, then rerun quick-setup",
-    )
 
 
 def _wait_for_local_health(

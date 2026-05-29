@@ -84,8 +84,6 @@ _DEFAULT_WEBHOOK_BIND = "0.0.0.0"
 
 _DEFAULT_SIDECAR_PORT = 8789
 _DEFAULT_SIDECAR_BIND = "127.0.0.1"
-_FINGERPRINT_VERSION = "sha256:16"
-
 # Photon iMessage messages from the SDK side have no documented hard
 # limit, but the underlying iMessage protocol limits practical message
 # size to ~16 KB.  Keep a conservative cap that matches BlueBubbles.
@@ -104,13 +102,6 @@ _SIDECAR_DIR = Path(__file__).parent / "sidecar"
 
 # ---------------------------------------------------------------------------
 # Module-level helpers — also used by check_fn / standalone send
-
-
-def _secret_fingerprint(value: str) -> str:
-    if not value:
-        return ""
-    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
-    return f"sha256:{digest}"
 
 
 def _coerce_port(value: Any, default: int) -> int:
@@ -405,8 +396,6 @@ class PhotonAdapter(BasePlatformAdapter):
                 retryable=False,
             )
             return False
-        self._write_runtime_project_metadata()
-
         mismatch = photon_tunnel.active_home_mismatch()
         if mismatch:
             owner_home, current_home = mismatch
@@ -477,36 +466,12 @@ class PhotonAdapter(BasePlatformAdapter):
 
         self._http_client = httpx.AsyncClient(timeout=30.0)
         self._mark_connected()
-        self._write_runtime_project_metadata()
         logger.info(
             "[photon] connected — webhook at %s:%d%s, sidecar on %s:%d",
             self._webhook_bind, self._webhook_port, self._webhook_path,
             self._sidecar_bind, self._sidecar_port,
         )
         return True
-
-    def _write_runtime_project_metadata(self) -> None:
-        try:
-            from gateway.status import write_runtime_status
-
-            write_runtime_status(
-                platform="photon",
-                platform_metadata={
-                    "project_id": self._project_id,
-                    "project_secret_fingerprint": _secret_fingerprint(
-                        self._project_secret
-                    ),
-                    "webhook_secret_fingerprint": _secret_fingerprint(
-                        self._webhook_secret
-                    ),
-                    "credential_fingerprint_version": _FINGERPRINT_VERSION,
-                    "webhook_port": self._webhook_port,
-                    "webhook_path": self._webhook_path,
-                    "webhook_public_url": self._webhook_public_url,
-                },
-            )
-        except Exception:
-            pass
 
     async def disconnect(self) -> None:
         await self._stop_sidecar()

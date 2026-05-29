@@ -100,78 +100,6 @@ def terminate_pid(pid: int, *, force: bool = False) -> None:
     os.kill(pid, sig)
 
 
-def _collect_descendant_pids(pid: int) -> list[int]:
-    """Return child/grandchild PIDs for ``pid`` without signalling them."""
-    root_pid = int(pid)
-
-    try:
-        import psutil  # type: ignore
-        parent = psutil.Process(root_pid)
-        return [int(child.pid) for child in parent.children(recursive=True)]
-    except Exception:
-        pass
-
-    if _IS_WINDOWS:
-        return []
-
-    try:
-        result = subprocess.run(
-            ["ps", "-eo", "pid=,ppid="],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return []
-    if result.returncode != 0:
-        return []
-
-    children_by_parent: dict[int, list[int]] = {}
-    for line in (result.stdout or "").splitlines():
-        parts = line.split()
-        if len(parts) < 2:
-            continue
-        try:
-            child_pid = int(parts[0])
-            parent_pid = int(parts[1])
-        except ValueError:
-            continue
-        children_by_parent.setdefault(parent_pid, []).append(child_pid)
-
-    descendants: list[int] = []
-    seen = {root_pid}
-    stack = [root_pid]
-    while stack:
-        current = stack.pop()
-        for child_pid in children_by_parent.get(current, []):
-            if child_pid in seen:
-                continue
-            seen.add(child_pid)
-            descendants.append(child_pid)
-            stack.append(child_pid)
-    return descendants
-
-
-def terminate_process_tree(pid: int, *, force: bool = False) -> None:
-    """Terminate a gateway PID and, on POSIX forced stops, its descendants.
-
-    Windows already uses ``taskkill /T /F`` in ``terminate_pid(force=True)``.
-    On POSIX, a forced parent kill can orphan adapter sidecars, so collect the
-    descendants before killing the parent and best-effort signal them too.
-    """
-    if _IS_WINDOWS or not force:
-        terminate_pid(pid, force=force)
-        return
-
-    descendants = _collect_descendant_pids(pid)
-    for child_pid in reversed(descendants):
-        try:
-            terminate_pid(child_pid, force=True)
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
-    terminate_pid(pid, force=True)
-
-
 def _scope_hash(identity: str) -> str:
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
 
@@ -583,7 +511,6 @@ def write_runtime_status(
     platform_state: Any = _UNSET,
     error_code: Any = _UNSET,
     error_message: Any = _UNSET,
-    platform_metadata: Any = _UNSET,
 ) -> None:
     """Persist gateway runtime health information for diagnostics/status."""
     path = _get_runtime_status_path()
@@ -598,11 +525,6 @@ def write_runtime_status(
 
     if gateway_state is not _UNSET:
         payload["gateway_state"] = gateway_state
-        if gateway_state == "starting" and platform is _UNSET:
-            # A new gateway process must not inherit stale platform entries
-            # from the previous runtime. Adapters republish their own status
-            # as they connect.
-            payload["platforms"] = {}
     if exit_reason is not _UNSET:
         payload["exit_reason"] = exit_reason
     if restart_requested is not _UNSET:
@@ -618,8 +540,6 @@ def write_runtime_status(
             platform_payload["error_code"] = error_code
         if error_message is not _UNSET:
             platform_payload["error_message"] = error_message
-        if platform_metadata is not _UNSET and isinstance(platform_metadata, dict):
-            platform_payload.update(platform_metadata)
         platform_payload["updated_at"] = _utc_now_iso()
         payload["platforms"][platform] = platform_payload
 

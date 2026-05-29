@@ -660,25 +660,6 @@ class TestLaunchdServiceRecovery:
         assert len(wait_called) == 1
         assert wait_called[0] == {"timeout": 10.0, "force_after": 5.0}
 
-    def test_wait_for_gateway_exit_force_kills_process_tree(self, monkeypatch, capsys):
-        calls = []
-        running = {"count": 0}
-
-        def fake_get_running_pid():
-            running["count"] += 1
-            return 321 if running["count"] == 1 else None
-
-        monkeypatch.setattr("gateway.status.get_running_pid", fake_get_running_pid)
-        monkeypatch.setattr(
-            gateway_cli,
-            "terminate_process_tree",
-            lambda pid, force=False: calls.append((pid, force)),
-        )
-
-        assert gateway_cli._wait_for_gateway_exit(timeout=1.0, force_after=0.0) is True
-        assert calls == [(321, True)]
-        assert "sent SIGKILL" in capsys.readouterr().out
-
     def test_launchd_status_reports_local_stale_plist_when_unloaded(self, tmp_path, monkeypatch, capsys):
         plist_path = tmp_path / "ai.hermes.gateway.plist"
         plist_path.write_text("<plist>old content</plist>", encoding="utf-8")
