@@ -54,10 +54,10 @@ mutate. That makes multi-home behavior explicit:
 | 3. Home owner | Stops if another Hermes home owns the Photon runtime state; otherwise records this `HERMES_HOME` as owner. |
 | 4. Phone user | Creates or verifies the shared iMessage user for `--phone`, then authorizes that sender in Hermes. |
 | 5. Sidecar | Verifies Node and installs `plugins/platforms/photon/sidecar` dependencies if needed. |
-| 6. Tunnel | Starts or reuses Cloudflare Quick Tunnel for the local webhook listener. |
-| 7. Webhook | Registers the current public `/photon/webhook` URL with Photon and saves its signing secret. |
-| 8. Gateway | Enables `platforms.photon`, starts or restarts only the current-home Hermes gateway when runtime secrets changed, and confirms the Photon adapter connects. |
-| 9. Proof | Waits for local health, public health, and `photon=connected`. |
+| 6. Tunnel | In managed Quick Tunnel mode, stops this Hermes home's recorded tunnel and starts a fresh `trycloudflare.com` endpoint. |
+| 7. Health | Enables `platforms.photon`, starts or reuses only the current-home gateway, and verifies local and public `/healthz` for the fresh URL. |
+| 8. Webhook | Deletes only this Hermes home's owned old `trycloudflare.com` webhooks, leaves unowned/manual webhooks alone, then registers the fresh public `/photon/webhook` URL and saves its signing secret. |
+| 9. Runtime | Restarts the current-home gateway when runtime secrets changed, then confirms public health and `photon=connected`. |
 
 Verbose mode streams useful logs while setup waits:
 
@@ -138,8 +138,11 @@ forwards to:
 http://127.0.0.1:8788/photon/webhook
 ```
 
-Quick Tunnel URLs can change after restarts. `quick-setup` and the
-gateway register the current URL and avoid deleting user-owned/manual
+Quick Tunnel URLs are ephemeral. In managed Quick Tunnel mode,
+`quick-setup` rotates to a fresh `trycloudflare.com` endpoint each run,
+deletes only webhook IDs recorded as owned by the current `HERMES_HOME`,
+and reports unowned managed webhooks as suspicious stale candidates. The
+gateway registers the current URL and avoids deleting user-owned/manual
 webhooks.
 
 For production or a stable URL, register your own reverse proxy instead:
@@ -222,11 +225,13 @@ Common public-health failures:
   Cloudflare DNS and the pinned IP. This is acceptable for local setup; do not
   churn the tunnel just for this status.
 - `system DNS failed` or `HTTP 530`: this Mac still cannot verify the current
-  Quick Tunnel hostname. Check DNS/network settings and rerun setup. Stop and
-  start the managed tunnel only when you intentionally want a fresh URL:
-  `hermes photon webhook tunnel stop && hermes photon webhook tunnel start`.
-- Extra stale managed webhooks: cleanup noise unless the current URL is
-  missing or unregistered.
+  Quick Tunnel hostname. Check DNS/network settings and rerun setup.
+  `quick-setup` rotates the managed Quick Tunnel automatically; manual
+  `webhook tunnel stop/start` is only needed when debugging the tunnel command
+  directly.
+- Extra unowned stale managed webhooks: cleanup noise unless the current URL is
+  missing or unregistered. Hermes reports them but does not delete them
+  automatically.
 
 ## Reset
 

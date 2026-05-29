@@ -116,6 +116,10 @@ class _PhotonSetupContext:
     assigned_phone_number: Optional[str] = None
     webhook_url: str = ""
     registered_hooks: Optional[list] = None
+    tunnel_pid: Optional[int] = None
+    owned_managed_webhook_ids: list[str] = field(default_factory=list)
+    unowned_managed_webhook_ids: list[str] = field(default_factory=list)
+    deleted_owned_webhook_ids: list[str] = field(default_factory=list)
     runtime_secrets_changed: bool = False
     gateway_started: bool = False
     local_health: Optional[_HealthResult] = None
@@ -543,10 +547,13 @@ def _run_quick_setup_reconciler(ctx: _PhotonSetupContext) -> None:
     _ensure_operator_phone(ctx)
     _ensure_sidecar_ready(ctx)
     _ensure_sidecar_port_available(ctx)
+    _prepare_managed_quick_tunnel_rotation(ctx)
     _ensure_public_webhook_path(ctx, wait_for_health=False)
+    _ensure_photon_gateway_platform_enabled(ctx)
+    _ensure_gateway_local_runtime(ctx)
+    _wait_for_public_health(ctx, reason="fresh public webhook path")
     webhook_result = _ensure_current_webhook_registered(ctx)
     _record_webhook_runtime_changes(ctx, webhook_result)
-    _ensure_photon_gateway_platform_enabled(ctx)
     _restart_gateway_if_runtime_secrets_changed(
         ctx,
         reason="Photon webhook state changed",
@@ -558,6 +565,112 @@ def _run_quick_setup_reconciler(ctx: _PhotonSetupContext) -> None:
         reason="post-webhook verification",
     )
     _wait_for_photon_connected(ctx)
+
+
+def _managed_quick_tunnel_mode() -> bool:
+    configured = (_get_env_value("PHOTON_WEBHOOK_PUBLIC_URL") or "").strip()
+    return not (configured and not photon_tunnel.is_trycloudflare_url(configured))
+
+
+def _prepare_managed_quick_tunnel_rotation(ctx: _PhotonSetupContext) -> None:
+    if not _managed_quick_tunnel_mode():
+        return
+
+    print("[webhook] Inspecting managed Photon webhook ownership...")
+    hooks = ctx.registered_hooks
+    if hooks is None:
+        try:
+            hooks = photon_auth.list_webhooks(ctx.project_id, ctx.project_secret)
+        except Exception as e:
+            raise _failed_invariant(
+                ctx,
+                step="registered webhook state",
+                summary="could not list Photon webhooks before managed tunnel rotation",
+                expected="Spectrum API returns registered webhooks for the current project",
+                observed=f"{type(e).__name__}: {e}",
+                evidence={"project_id": ctx.project_id, "http_status": _http_status(e)},
+                repair="validate Photon project credentials, then rerun quick-setup",
+            ) from e
+
+    _record_managed_webhook_classification(ctx, hooks)
+    if ctx.unowned_managed_webhook_ids:
+        print(
+            "  unowned managed trycloudflare.com webhooks left alone: "
+            + ", ".join(ctx.unowned_managed_webhook_ids)
+        )
+    elif ctx.owned_managed_webhook_ids:
+        print(
+            "  owned managed trycloudflare.com webhooks found: "
+            + ", ".join(ctx.owned_managed_webhook_ids)
+        )
+    else:
+        print("  no existing managed trycloudflare.com webhooks found")
+
+    stop_result = photon_tunnel.stop()
+    print(f"  tunnel      : {stop_result.get('message') or 'checked'}")
+    tunnel_state_after_stop = photon_tunnel.status()
+    if tunnel_state_after_stop.get("running"):
+        raise _failed_invariant(
+            ctx,
+            step="managed tunnel",
+            summary="recorded managed Quick Tunnel could not be stopped",
+            expected="old managed tunnel is stopped before owned webhooks are deleted",
+            observed={
+                "stop_result": stop_result,
+                "tunnel_state": tunnel_state_after_stop,
+            },
+            repair="stop the managed tunnel manually, then rerun quick-setup",
+        )
+
+    ctx.registered_hooks = _delete_stale_managed_webhooks(
+        ctx.project_id,
+        ctx.project_secret,
+        hooks,
+        keep_url="",
+        deleted_ids=ctx.deleted_owned_webhook_ids,
+    )
+    remaining_owned = sorted(
+        set(ctx.owned_managed_webhook_ids) - set(ctx.deleted_owned_webhook_ids)
+    )
+    if remaining_owned:
+        raise _failed_invariant(
+            ctx,
+            step="managed webhook cleanup",
+            summary="could not delete old owned managed Photon webhooks",
+            expected=(
+                "owned trycloudflare.com webhooks are deleted before a "
+                "fresh tunnel is created"
+            ),
+            observed={
+                "remaining_owned_webhook_ids": remaining_owned,
+                "deleted_owned_webhook_ids": ctx.deleted_owned_webhook_ids,
+                "unowned_managed_webhook_ids": ctx.unowned_managed_webhook_ids,
+            },
+            repair=(
+                "retry quick-setup; if it repeats, delete only these owned "
+                "webhook IDs from the Photon dashboard and rerun"
+            ),
+        )
+
+
+def _record_managed_webhook_classification(
+    ctx: _PhotonSetupContext,
+    hooks: list,
+) -> None:
+    owned_ids = photon_tunnel.owned_webhook_ids()
+    owned_managed: list[str] = []
+    unowned_managed: list[str] = []
+    for hook in hooks:
+        webhook_id = _webhook_id(hook)
+        url = _webhook_url(hook)
+        if not webhook_id or not photon_tunnel.is_trycloudflare_url(url):
+            continue
+        if webhook_id in owned_ids:
+            owned_managed.append(webhook_id)
+        else:
+            unowned_managed.append(webhook_id)
+    ctx.owned_managed_webhook_ids = sorted(set(owned_managed))
+    ctx.unowned_managed_webhook_ids = sorted(set(unowned_managed))
 
 
 def _ensure_dashboard_auth(ctx: _PhotonSetupContext) -> str:
@@ -1129,13 +1242,13 @@ def _ensure_public_webhook_path(
             _wait_for_public_health(ctx, reason="user-owned public URL")
         return
 
-    result = photon_tunnel.start(on_install=print)
+    result = photon_tunnel.start(on_install=print, force_new=True)
     if not result.success:
         raise _failed_invariant(
             ctx,
             step="managed tunnel",
-            summary="Cloudflare Quick Tunnel did not start",
-            expected="managed tunnel publishes a trycloudflare.com URL",
+            summary="Cloudflare Quick Tunnel did not start with a fresh endpoint",
+            expected="managed tunnel publishes a new trycloudflare.com URL",
             observed=result.error or "unknown cloudflared failure",
             evidence={
                 "cloudflared_log": str(result.log_path) if result.log_path else "",
@@ -1144,9 +1257,25 @@ def _ensure_public_webhook_path(
             },
             repair="inspect the cloudflared log and rerun quick-setup; install cloudflared manually if managed install failed",
         )
+    if result.reused:
+        raise _failed_invariant(
+            ctx,
+            step="managed tunnel",
+            summary="Cloudflare Quick Tunnel reused an existing endpoint",
+            expected=(
+                "quick-setup managed mode always rotates to a fresh "
+                "trycloudflare.com URL"
+            ),
+            observed={
+                "webhook_url": result.webhook_url,
+                "pid": result.pid,
+                "state": photon_tunnel.status(),
+            },
+            repair="stop the managed tunnel and rerun quick-setup",
+        )
     ctx.webhook_url = result.webhook_url
-    action = "reused" if result.reused else "started"
-    print(f"  ✓ {action} managed tunnel: {result.webhook_url}")
+    ctx.tunnel_pid = result.pid
+    print(f"  ✓ started fresh managed tunnel: {result.webhook_url}")
     if wait_for_health:
         _wait_for_public_health(ctx, reason="managed tunnel startup")
 
@@ -1168,11 +1297,13 @@ def _ensure_current_webhook_registered(
             repair="validate Photon project credentials, then rerun quick-setup",
         ) from e
 
+    _record_managed_webhook_classification(ctx, hooks)
     hooks = _delete_stale_managed_webhooks(
         ctx.project_id,
         ctx.project_secret,
         hooks,
         keep_url=ctx.webhook_url,
+        deleted_ids=ctx.deleted_owned_webhook_ids,
     )
     matching_hooks = [hook for hook in hooks if _webhook_url(hook) == ctx.webhook_url]
     if matching_hooks and _webhook_secret_present():
@@ -1864,6 +1995,7 @@ def _recycle_managed_tunnel_and_retry_public_health(
 
     previous_url = ctx.webhook_url
     ctx.webhook_url = result.webhook_url
+    ctx.tunnel_pid = result.pid
     ctx.public_health = None
     print(f"  ✓ refreshed managed tunnel: {result.webhook_url}")
 
@@ -2486,6 +2618,23 @@ def _print_quick_setup_reconciled(ctx: _PhotonSetupContext) -> None:
         )
     )
     print(f"  webhook URL       : {ctx.webhook_url}")
+    print(f"  tunnel PID        : {ctx.tunnel_pid if ctx.tunnel_pid is not None else 'n/a'}")
+    print(
+        "  deleted webhooks  : "
+        + (
+            ", ".join(ctx.deleted_owned_webhook_ids)
+            if ctx.deleted_owned_webhook_ids
+            else "none"
+        )
+    )
+    print(
+        "  unowned webhooks  : "
+        + (
+            ", ".join(ctx.unowned_managed_webhook_ids)
+            if ctx.unowned_managed_webhook_ids
+            else "none"
+        )
+    )
     print("  gateway runtime   : photon=connected")
     _print_text_photon_number_step(ctx.outcome())
 
@@ -3539,6 +3688,7 @@ def _delete_stale_managed_webhooks(
     hooks: list,
     *,
     keep_url: str,
+    deleted_ids: Optional[list[str]] = None,
 ) -> list:
     """Delete old managed Quick Tunnel webhooks for this Photon project.
 
@@ -3547,7 +3697,7 @@ def _delete_stale_managed_webhooks(
     healthy while Photon may deliver to an old profile/tunnel instead of
     the gateway the user just started.
     """
-    deleted_ids: set[str] = set()
+    deleted_id_set: set[str] = set()
     deleted_urls: set[str] = set()
     owned_ids = photon_tunnel.owned_webhook_ids()
     for hook in hooks:
@@ -3574,16 +3724,18 @@ def _delete_stale_managed_webhooks(
                 file=sys.stderr,
             )
             continue
-        deleted_ids.add(webhook_id)
+        deleted_id_set.add(webhook_id)
         deleted_urls.add(url)
+        if deleted_ids is not None and webhook_id not in deleted_ids:
+            deleted_ids.append(webhook_id)
         photon_tunnel.forget_owned_webhook(webhook_id)
         print(f"  ✓ deleted stale managed trycloudflare.com webhook: {webhook_id}")
 
-    if not deleted_ids and not deleted_urls:
+    if not deleted_id_set and not deleted_urls:
         return hooks
     return [
         hook for hook in hooks
-        if _webhook_id(hook) not in deleted_ids
+        if _webhook_id(hook) not in deleted_id_set
         and _webhook_url(hook) not in deleted_urls
     ]
 

@@ -73,12 +73,17 @@ hermes photon quick-setup --phone '+<country-code><number>'
 5. Adds the same `--phone` value to `PHOTON_ALLOWED_USERS` as the
    initial Hermes/Photon operator
 6. Runs `npm install` inside the plugin's sidecar directory
-7. Starts or reuses the gateway for the same Hermes home
-8. Proves local `/healthz`
-9. Starts or verifies the public webhook URL
-10. Registers the current webhook and saves its signing secret
-11. Restarts only the current-home gateway if runtime secrets changed
-12. Waits until gateway runtime reports `photon=connected`
+7. In managed Quick Tunnel mode, lists current Spectrum webhooks, stops
+   only this Hermes home's recorded `cloudflared` process, deletes only
+   owned old `trycloudflare.com` webhook IDs, and leaves unowned/manual
+   webhooks alone
+8. Starts a fresh `trycloudflare.com` endpoint instead of reusing a
+   saved Quick Tunnel URL
+9. Starts or reuses the gateway for the same Hermes home
+10. Proves local `/healthz` and public `/healthz`
+11. Registers the fresh webhook and saves its signing secret
+12. Restarts only the current-home gateway if runtime secrets changed
+13. Waits until gateway runtime reports `photon=connected`
 
 On success, Hermes prints the assigned iMessage number when Photon
 returns one and a compact health summary. On failure, it prints the
@@ -138,7 +143,9 @@ used by the gateway are stored as `PHOTON_PROJECT_ID` and
 
 ## Webhook tunnel
 
-Quick setup uses Cloudflare Quick Tunnel by default:
+Quick setup uses Cloudflare Quick Tunnel by default and rotates to a
+fresh `trycloudflare.com` endpoint on every run. The lower-level tunnel
+command can still reuse a currently running managed tunnel:
 
 ```bash
 hermes photon webhook tunnel start    # start/reuse tunnel and register webhook
@@ -156,10 +163,12 @@ that URL with Photon, and saves both `PHOTON_WEBHOOK_SECRET` and
 `PHOTON_WEBHOOK_PUBLIC_URL` in `~/.hermes/.env`. Runtime state and logs
 live under `~/.hermes/photon/`.
 
-Quick Tunnel URLs are temporary and can change after restart. This is
-fine for local setup and testing. For production, use a named Cloudflare
-Tunnel or another stable user-owned reverse proxy and register it
-manually:
+Quick Tunnel URLs are temporary and can change after restart or become
+unresolvable while a local `cloudflared` PID still exists. This is fine
+for local setup and testing because `quick-setup` self-heals by rotating
+the managed tunnel and reconciling the Photon webhook. For production,
+use a named Cloudflare Tunnel or another stable user-owned reverse proxy
+and register it manually:
 
 ```bash
 hermes photon webhook register https://YOUR-PUBLIC-URL/photon/webhook
@@ -178,12 +187,13 @@ PHOTON_WEBHOOK_PUBLIC_URL=https://YOUR-PUBLIC-URL/photon/webhook
 The plugin verifies every inbound `POST` against this secret and
 rejects deliveries with a timestamp drift greater than 5 minutes.
 If the same URL is already registered and `PHOTON_WEBHOOK_SECRET` is set
-locally, the command is a no-op. If the local secret is missing, delete
-or recreate the webhook in the Photon dashboard and save the new signing
-secret locally. The managed tunnel flow deletes stale
+locally, the manual register command is a no-op. If the local secret is
+missing, delete or recreate the webhook in the Photon dashboard and save
+the new signing secret locally. The managed tunnel flow deletes stale
 `trycloudflare.com` webhooks it created when the tunnel URL changes, but
-leaves user-owned/manual webhook URLs alone. The gateway performs the
-same cleanup when Photon connects, so the active gateway profile owns
+leaves unowned managed webhook IDs and user-owned/manual webhook URLs
+alone. The gateway performs the same cleanup when Photon connects, so
+the active gateway profile owns
 the current managed webhook registration.
 
 If the managed `cloudflared` install fails, Hermes prints manual install
@@ -296,8 +306,10 @@ Common issues:
   Re-run `hermes photon webhook tunnel start` or
   `hermes photon webhook register` and store the secret.
 - **`managed tunnel : ✗ stopped`** — run
-  `hermes photon webhook tunnel start`. Quick Tunnel URLs can change
-  after restart, so Hermes will update the registered Photon webhook.
+  `hermes photon quick-setup --phone '+<country-code><number>'` to rotate
+  the Quick Tunnel and update the registered Photon webhook. Use
+  `hermes photon webhook tunnel start` only for lower-level tunnel
+  debugging.
 - **`public health : ✗ unreachable (... HTTP Error 502: Bad Gateway)`** —
   Cloudflare reached the tunnel before the local gateway was ready.
   `hermes photon status` checks local health and service identity before
@@ -309,11 +321,12 @@ Common issues:
 - **`public health : ✗ unreachable (... system DNS failed to resolve ...)`
   or `HTTP Error 530`** — this Mac cannot resolve the current Quick
   Tunnel hostname even after fallback verification. Check DNS/network
-  settings and rerun setup. Stop and start the managed tunnel only when
-  you intentionally want a fresh URL.
+  settings and rerun setup. Quick setup rotates the managed tunnel for
+  you.
 - **`registered webhooks : ... unowned stale managed`** — old managed
-  URLs are visible in Photon but are not the first thing to fix when
-  the current URL is registered. Public health and gateway connection
+  URLs are visible in Photon but are not owned by this Hermes home.
+  Hermes reports them as stale candidates but does not delete them
+  automatically. Public health and gateway connection
   are the blocking checks; delete old webhook IDs manually later with
   `hermes photon webhook list` if needed.
 - **`gateway runtime project identity` failed** — quick setup validated

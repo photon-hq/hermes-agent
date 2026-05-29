@@ -466,6 +466,22 @@ def forget_owned_webhook(webhook_id: str) -> None:
     save_state(state)
 
 
+def clear_runtime_state(*, preserve_owned_webhooks: bool = True) -> None:
+    """Clear the managed tunnel runtime record without losing ownership data."""
+    path = state_path()
+    state = load_state()
+    owned = state.get("owned_webhooks") if isinstance(state, dict) else None
+    if preserve_owned_webhooks and owned:
+        save_state({"owned_webhooks": owned})
+        return
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    except OSError:
+        save_state({})
+
+
 def pid_is_running(pid: Any) -> bool:
     try:
         parsed = int(pid)
@@ -923,25 +939,65 @@ def start(
 
 
 def stop(timeout_seconds: float = 5.0) -> dict[str, Any]:
+    state = load_state()
+    if not state.get("managed"):
+        return {"stopped": False, "message": "no managed tunnel is recorded"}
+
+    raw_pid = state.get("pid")
+    try:
+        parsed = int(raw_pid)
+    except (TypeError, ValueError):
+        clear_runtime_state(preserve_owned_webhooks=True)
+        return {
+            "stopped": False,
+            "message": "managed tunnel had no recorded pid; cleared stale state",
+        }
+
+    running = pid_is_running(parsed)
+    looks_like_cloudflared = _pid_looks_like_cloudflared(parsed) if running else False
+    if not running:
+        clear_runtime_state(preserve_owned_webhooks=True)
+        return {
+            "stopped": False,
+            "message": "managed tunnel was not running; cleared stale state",
+        }
+    if not looks_like_cloudflared:
+        clear_runtime_state(preserve_owned_webhooks=True)
+        return {
+            "stopped": False,
+            "message": (
+                f"recorded managed tunnel pid {parsed} is not cloudflared; "
+                "cleared stale state"
+            ),
+        }
+
     current = status()
     pid = current.get("pid")
     if not pid:
-        return {"stopped": False, "message": "managed tunnel is not running"}
+        clear_runtime_state(preserve_owned_webhooks=True)
+        return {
+            "stopped": False,
+            "message": "managed tunnel is not running; cleared stale state",
+        }
 
-    parsed = int(pid)
     try:
         if hasattr(os, "killpg"):
             os.killpg(parsed, signal.SIGTERM)
         else:
             os.kill(parsed, signal.SIGTERM)
     except ProcessLookupError:
-        return {"stopped": False, "message": "managed tunnel was already stopped"}
+        clear_runtime_state(preserve_owned_webhooks=True)
+        return {
+            "stopped": False,
+            "message": "managed tunnel was already stopped; cleared stale state",
+        }
     except OSError as e:
         return {"stopped": False, "message": f"could not stop tunnel: {e}"}
 
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         if not pid_is_running(parsed):
+            clear_runtime_state(preserve_owned_webhooks=True)
             return {"stopped": True, "message": f"stopped managed tunnel pid {parsed}"}
         time.sleep(0.1)
 
@@ -952,6 +1008,7 @@ def stop(timeout_seconds: float = 5.0) -> dict[str, Any]:
             os.kill(parsed, signal.SIGKILL)
     except OSError:
         pass
+    clear_runtime_state(preserve_owned_webhooks=True)
     return {"stopped": True, "message": f"stopped managed tunnel pid {parsed}"}
 
 
