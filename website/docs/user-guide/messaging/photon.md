@@ -93,6 +93,16 @@ runtime status, use verbose mode:
 hermes photon quick-setup -v --phone '+<country-code><number>'
 ```
 
+:::note Testing with a custom Hermes home
+
+If you export `HERMES_HOME` to test Photon in an isolated home,
+`quick-setup` uses that exported home as the current home. An installed
+gateway service for another home is ignored, not rewritten. Photon will
+start a temporary gateway for the current home when the webhook port is
+free, and will fail if another process already owns that port.
+
+:::
+
 Advanced/debug commands remain available:
 
 ```bash
@@ -292,9 +302,10 @@ Common issues:
   Cloudflare reached the tunnel before the local gateway was ready.
   `hermes photon status` checks local health and service identity before
   suggesting a repair.
-- **`public health : ✗ unreachable (... nodename nor servname provided ...)`
-  or `HTTP Error 530`** — the saved Quick Tunnel hostname is not usable.
-  Run `hermes photon webhook tunnel stop && hermes photon webhook tunnel start`.
+- **`public health : ✗ unreachable (... system DNS failed to resolve ...)`
+  or `HTTP Error 530`** — this Mac cannot resolve the current Quick
+  Tunnel hostname. Wait 30-60 seconds and rerun setup; if it repeats,
+  run `hermes photon webhook tunnel stop && hermes photon webhook tunnel start`.
 - **`registered webhooks : ... unowned stale managed`** — old managed
   URLs are visible in Photon but are not the first thing to fix when
   the current URL is registered. Public health and gateway connection

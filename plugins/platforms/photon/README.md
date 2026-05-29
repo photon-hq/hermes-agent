@@ -27,6 +27,13 @@ the dashboard.
 `quick-setup` is idempotent. Run it again after a reset, tunnel change,
 gateway restart, or partial setup failure.
 
+If you intentionally export a different `HERMES_HOME` for testing,
+`quick-setup` treats that exported home as the active Hermes home. An
+installed gateway service for another home is not reused or rewritten;
+Photon starts a temporary gateway for the current home when the webhook
+port is free. If another process already owns the webhook port, setup
+fails instead of guessing which home should own it.
+
 ### What Quick Setup Does
 
 | Step | What it checks or changes |
@@ -199,7 +206,10 @@ hermes photon webhook tunnel stop
 Common public-health failures:
 
 - `HTTP 502`: Cloudflare reached the tunnel before the gateway was ready.
-- `HTTP 530` or DNS errors: the current Quick Tunnel hostname is stale.
+- `system DNS failed` or `HTTP 530`: this Mac cannot resolve the current
+  Quick Tunnel hostname. Wait 30-60 seconds and rerun setup; if it
+  repeats, stop and start the managed tunnel to get a fresh hostname:
+  `hermes photon webhook tunnel stop && hermes photon webhook tunnel start`.
 - Extra stale managed webhooks: cleanup noise unless the current URL is
   missing or unregistered.
 

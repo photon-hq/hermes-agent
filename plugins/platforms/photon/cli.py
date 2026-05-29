@@ -23,6 +23,7 @@ import json
 import os
 import plistlib
 import re
+import signal
 import shlex
 import shutil
 import subprocess
@@ -39,6 +40,8 @@ from . import tunnel as photon_tunnel
 
 _SIDECAR_DIR = Path(__file__).parent / "sidecar"
 _MIN_SPECTRUM_TS_VERSION = (1, 7, 2)
+_DEFAULT_SIDECAR_PORT = 8789
+_DEFAULT_SIDECAR_BIND = "127.0.0.1"
 _PHONE_FORMAT = "+<country-code><number>"
 _PHONE_ARG_PLACEHOLDER = f"'{_PHONE_FORMAT}'"
 _FINGERPRINT_VERSION = "sha256:16"
@@ -527,6 +530,7 @@ def _run_quick_setup_reconciler(ctx: _PhotonSetupContext) -> None:
     _ensure_active_home_available(ctx)
     _ensure_operator_phone(ctx)
     _ensure_sidecar_ready(ctx)
+    _ensure_sidecar_port_available(ctx)
     _ensure_public_webhook_path(ctx, wait_for_health=False)
     webhook_result = _ensure_current_webhook_registered(ctx)
     ctx.registered_hooks = webhook_result.hooks
@@ -968,10 +972,91 @@ def _ensure_sidecar_ready(ctx: _PhotonSetupContext) -> None:
     print(f"  {status}")
 
 
+def _ensure_sidecar_port_available(ctx: _PhotonSetupContext) -> None:
+    port = _sidecar_port()
+    owner = _sidecar_port_owner(port)
+    if not owner.get("present"):
+        print(f"  ✓ sidecar port available ({_DEFAULT_SIDECAR_BIND}:{port})")
+        return
+
+    current_home = _canonical_path_str(ctx.hermes_home)
+    owner_home_raw = str(owner.get("hermes_home") or "").strip()
+    owner_home = _canonical_path_str(owner_home_raw) if owner_home_raw else ""
+    is_photon_sidecar = bool(owner.get("is_photon_sidecar"))
+    is_other_home = bool(owner_home and owner_home != current_home)
+    is_orphan = str(owner.get("ppid") or "").strip() == "1"
+
+    if is_photon_sidecar and is_other_home and is_orphan:
+        pid = str(owner.get("pid") or "").strip()
+        if pid and _terminate_process(pid):
+            print(
+                f"  ✓ stopped stale Photon sidecar pid {pid} from {owner_home}"
+            )
+            return
+        raise _sidecar_port_failure(
+            ctx,
+            owner,
+            summary="stale Photon sidecar from another Hermes home could not be stopped",
+            repair=(
+                f"stop pid {pid or '<unknown>'} manually, or set "
+                "PHOTON_SIDECAR_PORT to a free port, then rerun quick-setup"
+            ),
+        )
+
+    if (
+        is_photon_sidecar
+        and owner_home == current_home
+        and _inspect_gateway_runtime().get("running")
+    ):
+        print(
+            f"  ✓ sidecar port already owned by current-home Photon sidecar "
+            f"(pid {owner.get('pid')})"
+        )
+        return
+
+    if is_photon_sidecar and is_other_home:
+        summary = "Photon sidecar port is owned by another Hermes home"
+    elif is_photon_sidecar:
+        summary = "Photon sidecar port is already owned by a stale sidecar"
+    else:
+        summary = "Photon sidecar port is already in use"
+    raise _sidecar_port_failure(
+        ctx,
+        owner,
+        summary=summary,
+        repair=(
+            f"stop pid {owner.get('pid') or '<unknown>'}, or set "
+            "PHOTON_SIDECAR_PORT to a free port, then rerun quick-setup"
+        ),
+    )
+
+
+def _sidecar_port_failure(
+    ctx: _PhotonSetupContext,
+    owner: dict[str, Any],
+    *,
+    summary: str,
+    repair: str,
+) -> _FailedInvariant:
+    port = int(owner.get("port") or _sidecar_port())
+    raise _failed_invariant(
+        ctx,
+        step="sidecar port",
+        summary=summary,
+        expected=f"current Hermes home can bind {_DEFAULT_SIDECAR_BIND}:{port}",
+        observed=owner,
+        evidence={"sidecar_port": port, "sidecar_bind": _DEFAULT_SIDECAR_BIND},
+        repair=repair,
+    )
+
+
 def _ensure_gateway_local_runtime(ctx: _PhotonSetupContext) -> None:
     print("[gateway] Ensuring current-home gateway serves local Photon health...")
-    service = _inspect_gateway_service_identity(ctx)
-    _fail_if_service_home_mismatch(ctx, service)
+    service = _service_for_current_home(
+        ctx,
+        _inspect_gateway_service_identity(ctx),
+        announce=True,
+    )
     runtime = _inspect_gateway_runtime()
     if runtime.get("running"):
         restarted = _reconcile_gateway_runtime_identity(
@@ -1182,8 +1267,11 @@ def _ensure_current_webhook_registered(
 
 def _restart_current_home_gateway(ctx: _PhotonSetupContext) -> None:
     print("[gateway] Restarting current-home gateway to load updated Photon secrets...")
-    service = _inspect_gateway_service_identity(ctx)
-    _fail_if_service_home_mismatch(ctx, service)
+    service = _service_for_current_home(
+        ctx,
+        _inspect_gateway_service_identity(ctx),
+        announce=True,
+    )
     try:
         if service.get("installed") and service.get("manager") == "launchd":
             from hermes_cli import gateway as gateway_cli  # type: ignore
@@ -1269,6 +1357,7 @@ def _wait_for_photon_connected(ctx: _PhotonSetupContext, timeout_seconds: float 
 
 
 def _start_current_home_gateway(ctx: _PhotonSetupContext, service: dict[str, Any]) -> None:
+    service = _service_for_current_home(ctx, service, announce=True)
     try:
         if service.get("installed") and service.get("manager") == "launchd":
             from hermes_cli import gateway as gateway_cli  # type: ignore
@@ -1659,8 +1748,6 @@ def _reconcile_gateway_runtime_identity(
     reason: str,
     timeout_seconds: float = 60.0,
 ) -> bool:
-    service = _inspect_gateway_service_identity(ctx)
-    _fail_if_service_home_mismatch(ctx, service)
     deadline = time.monotonic() + timeout_seconds
     last_runtime = _inspect_gateway_runtime()
     last_comparison = _runtime_identity_comparison(
@@ -1871,6 +1958,25 @@ def _wait_for_public_health(
                 "port_owner": _port_owner(ctx.webhook_port),
             },
             repair="repair the current-home gateway local health before changing tunnel or webhook state",
+        )
+    if _public_health_is_system_dns_failure(last[1]):
+        raise _failed_invariant(
+            ctx,
+            step="public webhook DNS",
+            summary="this Mac cannot resolve the Cloudflare Quick Tunnel hostname",
+            expected="system DNS resolves the public Quick Tunnel hostname",
+            observed=_public_health_evidence(last),
+            evidence={
+                "reason": reason,
+                "webhook_url": ctx.webhook_url,
+                "local_health": _health_evidence(local),
+                "managed_tunnel": photon_tunnel.status(),
+            },
+            repair=(
+                "wait 30-60 seconds and rerun quick-setup; if it repeats: "
+                "hermes photon webhook tunnel stop && "
+                "hermes photon webhook tunnel start"
+            ),
         )
     raise _failed_invariant(
         ctx,
@@ -2101,29 +2207,39 @@ def _inspect_gateway_service_identity(ctx: _PhotonSetupContext) -> dict[str, Any
     return evidence
 
 
-def _fail_if_service_home_mismatch(
+def _service_for_current_home(
     ctx: _PhotonSetupContext,
     service: dict[str, Any],
-) -> None:
+    *,
+    announce: bool = False,
+) -> dict[str, Any]:
     service_home = str(service.get("service_home") or "").strip()
     if not service_home:
-        return
+        return service
     expected = _canonical_path_str(ctx.hermes_home)
     observed = _canonical_path_str(service_home)
     if observed == expected:
-        return
-    raise _failed_invariant(
-        ctx,
-        step="gateway service identity",
-        summary="installed gateway service points at another Hermes home",
-        expected=f"service HERMES_HOME={expected}",
-        observed={
-            "service_home": observed,
-            "current_home": expected,
-            "service": service,
-        },
-        repair="repair or reinstall the gateway service for the current Hermes home; quick-setup will not mutate another home",
-    )
+        return service
+
+    ignored = dict(service)
+    ignored.update({
+        "ignored": True,
+        "ignore_reason": (
+            "installed gateway service HERMES_HOME does not match the current "
+            "Hermes home"
+        ),
+        "ignored_service_home": observed,
+        "current_home": expected,
+        "installed": False,
+        "running": False,
+    })
+    if announce and service.get("installed"):
+        manager = str(service.get("manager") or "installed")
+        print(
+            f"  installed {manager} gateway service belongs to {observed}; "
+            f"using a temporary gateway for {expected}"
+        )
+    return ignored
 
 
 def _parse_systemd_environment(text: str) -> dict[str, str]:
@@ -2174,6 +2290,38 @@ def _inspect_gateway_runtime() -> dict[str, Any]:
         }
 
 
+def _sidecar_port() -> int:
+    raw = (_get_env_value("PHOTON_SIDECAR_PORT") or "").strip()
+    if not raw:
+        return _DEFAULT_SIDECAR_PORT
+    try:
+        port = int(raw)
+    except ValueError:
+        return _DEFAULT_SIDECAR_PORT
+    return port if 1 <= port <= 65535 else _DEFAULT_SIDECAR_PORT
+
+
+def _sidecar_port_owner(port: int) -> dict[str, Any]:
+    owner = _port_owner(port)
+    if not owner.get("present"):
+        return owner
+    pid = str(owner.get("pid") or "").strip()
+    if not pid:
+        return owner
+
+    command = _process_command(pid)
+    env = _process_env(pid)
+    ppid = _process_parent_pid(pid)
+    owner.update({
+        "ppid": ppid,
+        "full_command": command,
+        "hermes_home": env.get("HERMES_HOME", ""),
+        "photon_sidecar_port": env.get("PHOTON_SIDECAR_PORT", ""),
+        "is_photon_sidecar": _is_photon_sidecar_process(command),
+    })
+    return owner
+
+
 def _port_owner(port: int) -> dict[str, Any]:
     evidence: dict[str, Any] = {"present": False, "port": port}
     if os.name == "posix" and shutil.which("lsof"):
@@ -2214,6 +2362,99 @@ def _port_owner(port: int) -> dict[str, Any]:
     finally:
         sock.close()
     return evidence
+
+
+def _process_command(pid: str) -> str:
+    if os.name != "posix":
+        return ""
+    try:
+        proc = subprocess.run(  # noqa: S603
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return (proc.stdout or "").strip()
+
+
+def _process_parent_pid(pid: str) -> str:
+    if os.name != "posix":
+        return ""
+    try:
+        proc = subprocess.run(  # noqa: S603
+            ["ps", "-p", str(pid), "-o", "ppid="],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return (proc.stdout or "").strip()
+
+
+def _process_env(pid: str) -> dict[str, str]:
+    if os.name != "posix":
+        return {}
+    try:
+        proc = subprocess.run(  # noqa: S603
+            ["ps", "eww", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    text = proc.stdout or ""
+    env: dict[str, str] = {}
+    for item in text.split():
+        if "=" not in item:
+            continue
+        key, value = item.split("=", 1)
+        if key in {"HERMES_HOME", "PHOTON_SIDECAR_PORT", "PHOTON_WEBHOOK_PORT"}:
+            env[key] = value
+    return env
+
+
+def _is_photon_sidecar_process(command: str) -> bool:
+    normalized = command.replace("\\", "/")
+    return "/plugins/platforms/photon/sidecar/index.mjs" in normalized
+
+
+def _terminate_process(pid: str, timeout_seconds: float = 3.0) -> bool:
+    try:
+        pid_int = int(pid)
+    except (TypeError, ValueError):
+        return False
+    try:
+        os.kill(pid_int, signal.SIGTERM)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if not _pid_alive(pid_int):
+            return True
+        time.sleep(0.1)
+    return not _pid_alive(pid_int)
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
 
 
 def _check_local_health(ctx: _PhotonSetupContext, timeout_seconds: float = 2.0) -> _HealthResult:
@@ -3761,14 +4002,15 @@ def _public_health_next_step(
     detail_lower = (detail or "").lower()
     managed_quick_tunnel = photon_tunnel.is_trycloudflare_url(public_url)
     if managed_quick_tunnel and (
-        "nodename nor servname" in detail_lower
+        "system dns failed" in detail_lower
+        or "nodename nor servname" in detail_lower
         or "name or service not known" in detail_lower
         or "no address associated" in detail_lower
         or "http error 530" in detail_lower
     ):
         return (
-            "hermes photon webhook tunnel stop && "
-            "hermes photon webhook tunnel start"
+            "wait 30-60s and rerun; if it repeats: "
+            "hermes photon webhook tunnel stop && hermes photon webhook tunnel start"
         )
 
     if not tunnel_state.get("running"):
@@ -3807,7 +4049,15 @@ def _check_public_health_for_status(public_url: str) -> tuple[bool, str]:
 
 def _public_health_can_be_transient(detail: str) -> bool:
     detail_lower = (detail or "").lower()
-    return "http error 502" in detail_lower or "bad gateway" in detail_lower
+    return (
+        "http error 502" in detail_lower
+        or "bad gateway" in detail_lower
+        or _public_health_is_system_dns_failure(detail)
+    )
+
+
+def _public_health_is_system_dns_failure(detail: str) -> bool:
+    return "system dns failed" in (detail or "").lower()
 
 
 def _docs_paths() -> str:

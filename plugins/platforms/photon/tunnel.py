@@ -10,6 +10,7 @@ import shutil
 import signal
 import ssl
 import subprocess
+import socket
 import tarfile
 import tempfile
 import time
@@ -214,7 +215,33 @@ def check_public_health(webhook_url: str, timeout_seconds: float = 5.0) -> tuple
                 return True, health_url
             return False, f"{health_url} returned {getattr(response, 'status', '?')}"
     except Exception as e:
-        return False, f"{health_url} failed: {e}"
+        detail = f"{health_url} failed: {e}"
+        if _looks_like_dns_resolution_failure(e):
+            return False, f"{detail}; {_system_dns_failure_detail(health_url)}"
+        return False, detail
+
+
+def _looks_like_dns_resolution_failure(exc: BaseException) -> bool:
+    reason = getattr(exc, "reason", None)
+    if isinstance(reason, socket.gaierror):
+        return True
+    if isinstance(exc, socket.gaierror):
+        return True
+    text = str(exc).lower()
+    return (
+        "nodename nor servname provided" in text
+        or "name or service not known" in text
+        or "temporary failure in name resolution" in text
+        or "could not resolve" in text
+    )
+
+
+def _system_dns_failure_detail(health_url: str) -> str:
+    parsed = urlparse(health_url)
+    host = parsed.hostname or ""
+    if not host:
+        return "system DNS failed before a hostname was available"
+    return f"system DNS failed to resolve {host}"
 
 
 def parse_quick_tunnel_url(text: str) -> str:

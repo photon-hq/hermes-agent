@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import socket
+import urllib.error
 from pathlib import Path
 from typing import Any
 
@@ -66,3 +68,41 @@ def test_start_ignores_old_log_urls(
     assert result.webhook_url == f"{new_url}/photon/webhook"
     saved = json.loads(state_path.read_text(encoding="utf-8"))
     assert saved["public_url"] == new_url
+
+
+def test_public_health_classifies_system_dns_failure(
+    monkeypatch: Any,
+) -> None:
+    url = "https://fresh.trycloudflare.com/photon/webhook"
+
+    def fake_urlopen(*_args: Any, **_kwargs: Any) -> None:
+        raise urllib.error.URLError(
+            socket.gaierror(8, "nodename nor servname provided, or not known")
+        )
+
+    monkeypatch.setattr(photon_tunnel.urllib.request, "urlopen", fake_urlopen)
+
+    ok, detail = photon_tunnel.check_public_health(url)
+
+    assert ok is False
+    assert "nodename nor servname provided" in detail
+    assert "system DNS failed" in detail
+    assert "resolve fresh.trycloudflare.com" in detail
+
+
+def test_public_health_classifies_curl_style_dns_failure(
+    monkeypatch: Any,
+) -> None:
+    def fake_urlopen(*_args: Any, **_kwargs: Any) -> None:
+        raise urllib.error.URLError("could not resolve host")
+
+    monkeypatch.setattr(photon_tunnel.urllib.request, "urlopen", fake_urlopen)
+
+    ok, detail = photon_tunnel.check_public_health(
+        "https://fresh.trycloudflare.com/photon/webhook"
+    )
+
+    assert ok is False
+    assert "could not resolve host" in detail
+    assert "system DNS failed" in detail
+    assert "resolve fresh.trycloudflare.com" in detail
