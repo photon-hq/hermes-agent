@@ -26,6 +26,7 @@ DEFAULT_START_TIMEOUT_SECONDS = 30.0
 CLOUDFLARED_RELEASE_API = "https://api.github.com/repos/cloudflare/cloudflared/releases/latest"
 _TRYCLOUDFLARE_RE = re.compile(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com")
 _IPV4_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
+_CLOUDFLARE_DNS_RESOLVER = "1.1.1.1"
 
 
 @dataclass
@@ -38,6 +39,13 @@ class TunnelStartResult:
     error: str = ""
     log_path: Optional[Path] = None
     command: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class _ExplicitDnsHealthResult:
+    ok: bool
+    detail: str = ""
+    resolved: bool = False
 
 
 @dataclass(frozen=True)
@@ -218,14 +226,16 @@ def check_public_health(webhook_url: str, timeout_seconds: float = 5.0) -> tuple
     except Exception as e:
         detail = f"{health_url} failed: {e}"
         if _looks_like_dns_resolution_failure(e):
-            fallback_ok, fallback_detail = _check_public_health_with_explicit_dns(
+            fallback = _check_public_health_with_explicit_dns(
                 health_url,
                 timeout_seconds=timeout_seconds,
             )
-            if fallback_ok:
-                return True, fallback_detail
-            if fallback_detail:
-                detail = f"{detail}; {fallback_detail}"
+            if fallback.ok:
+                return True, fallback.detail
+            if fallback.resolved:
+                return False, fallback.detail
+            if fallback.detail:
+                detail = f"{detail}; {fallback.detail}"
             return False, f"{detail}; {_system_dns_failure_detail(health_url)}"
         return False, detail
 
@@ -234,17 +244,23 @@ def _check_public_health_with_explicit_dns(
     health_url: str,
     *,
     timeout_seconds: float,
-) -> tuple[bool, str]:
+) -> _ExplicitDnsHealthResult:
     parsed = urlparse(health_url)
     host = parsed.hostname or ""
     if not host or parsed.scheme != "https" or not is_trycloudflare_url(health_url):
-        return False, ""
-    ip = _resolve_a_record_with_dig(host)
+        return _ExplicitDnsHealthResult(False)
+    ip = _resolve_a_record_with_cloudflare_dns(host)
     if not ip:
-        return False, "explicit DNS fallback could not resolve an A record"
+        return _ExplicitDnsHealthResult(
+            False,
+            "Cloudflare DNS fallback could not resolve an A record",
+        )
     curl = shutil.which("curl")
     if not curl:
-        return False, "explicit DNS fallback unavailable: curl not found"
+        return _ExplicitDnsHealthResult(
+            False,
+            "Cloudflare DNS fallback unavailable: curl not found",
+        )
     port = parsed.port or 443
     try:
         result = subprocess.run(  # noqa: S603
@@ -263,21 +279,42 @@ def _check_public_health_with_explicit_dns(
             check=False,
         )
     except Exception as e:
-        return False, f"explicit DNS fallback failed: {type(e).__name__}: {e}"
+        return _ExplicitDnsHealthResult(
+            False,
+            f"{health_url} failed after Cloudflare DNS fallback via {ip}: "
+            f"{type(e).__name__}: {e}",
+            resolved=True,
+        )
     body = (result.stdout or "").strip()
     if result.returncode == 0 and body == "ok":
-        return True, f"{health_url} (explicit DNS fallback via {ip})"
+        return _ExplicitDnsHealthResult(
+            True,
+            f"{health_url} (Cloudflare DNS fallback via {ip})",
+            resolved=True,
+        )
     detail = (result.stderr or body or f"curl exited {result.returncode}").strip()
-    return False, f"explicit DNS fallback failed: {detail}"
+    return _ExplicitDnsHealthResult(
+        False,
+        f"{health_url} failed after Cloudflare DNS fallback via {ip}: {detail}",
+        resolved=True,
+    )
 
 
-def _resolve_a_record_with_dig(host: str) -> str:
+def _resolve_a_record_with_cloudflare_dns(host: str) -> str:
     dig = shutil.which("dig")
     if not dig:
         return ""
     try:
         result = subprocess.run(  # noqa: S603
-            [dig, "+short", host, "A"],
+            [
+                dig,
+                f"@{_CLOUDFLARE_DNS_RESOLVER}",
+                "+time=3",
+                "+tries=1",
+                "+short",
+                host,
+                "A",
+            ],
             capture_output=True,
             text=True,
             timeout=5,
