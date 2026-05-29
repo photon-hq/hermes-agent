@@ -1,190 +1,193 @@
 # Photon iMessage platform plugin
 
-Photon lets you text your local Hermes Agent through iMessage and use
-that thread as your main Hermes interface. Photon owns the iMessage
-line and delivery layer; your computer runs Hermes, the webhook
-receiver, and the local tunnel Photon uses to reach it.
+Photon lets you text a local Hermes Agent through iMessage. Photon owns
+the iMessage/Spectrum delivery layer. Hermes owns the local gateway,
+webhook verification, agent execution, and replies.
 
-For daily use, the tunnel and the Hermes gateway must stay running. If
-either stops, incoming texts will not reach Hermes until both are back
-up.
+Daily runtime needs three pieces running:
 
-The free tier uses Photon's shared iMessage line pool (`type: shared`).
-Use that unless you already pay for a dedicated Photon number.
+- Hermes gateway: receives Photon webhooks and runs the agent.
+- Cloudflare tunnel: gives Photon a public URL for your local gateway.
+- Photon sidecar: sends outbound iMessage replies through `spectrum-ts`.
 
-## Quick setup
+The free Photon path uses shared iMessage lines (`type: shared`). If
+Photon says no shared numbers are available for your phone, that is a
+Photon allocation/rate-limit state, not a Hermes tunnel problem.
+
+## Quick Setup
 
 ```bash
 hermes photon quick-setup --phone '+<country-code><number>'
 ```
 
-Use your E.164 phone number: `+` plus country code and number, with no
-spaces. Setup authorizes that phone automatically, so your first
-iMessage goes straight to Hermes. Photon may assign a different shared
-iMessage sending number for each phone you register; use the assigned
-number shown for that user in the Photon dashboard. To add another
-phone later:
+Use E.164 format: `+` plus country code and number, with no spaces.
+After setup, text the assigned Photon iMessage number shown by Photon or
+the dashboard.
 
-```bash
-hermes photon allow-phone '+<country-code><number>'
-```
+`quick-setup` is idempotent. Run it again after a reset, tunnel change,
+gateway restart, or partial setup failure.
 
-`quick-setup` is the reconciler for this machine. It validates or runs
-Photon dashboard login, creates or adopts the Photon project, validates
-Spectrum credentials, creates or verifies the shared iMessage user,
-authorizes the operator phone, installs sidecar dependencies, starts or
-reuses the current-home gateway, proves local `/healthz`, starts or
-verifies the public webhook path, registers the current webhook, saves
-the signing secret, restarts only the current-home gateway when runtime
-secrets changed, and waits for `photon=connected`.
+### What Quick Setup Does
 
-It is safe to run again. Cached state is revalidated before reuse. On
-success it prints the assigned iMessage number when Photon returns one
-and a compact health summary. On failure it prints the exact invariant
-that failed with evidence such as Hermes home, env path, service home,
-port owner, local health, public health, webhook state, project id, and
-the last relevant gateway/Photon log lines.
+| Step | What it checks or changes |
+|------|----------------------------|
+| 1. Login | Validates the Photon dashboard token, or runs device login. |
+| 2. Project | Adopts or creates a Spectrum+iMessage project and stores `PHOTON_PROJECT_ID` / `PHOTON_PROJECT_SECRET`. |
+| 3. Home owner | Makes sure this `HERMES_HOME` owns the Photon runtime state. |
+| 4. Phone user | Creates or verifies the shared iMessage user for `--phone`, then authorizes that sender in Hermes. |
+| 5. Sidecar | Verifies Node and installs `plugins/platforms/photon/sidecar` dependencies if needed. |
+| 6. Tunnel | Starts or reuses Cloudflare Quick Tunnel for the local webhook listener. |
+| 7. Webhook | Registers the current public `/photon/webhook` URL with Photon and saves its signing secret. |
+| 8. Gateway | Starts or restarts only the current-home Hermes gateway when runtime secrets changed. |
+| 9. Proof | Waits for local health, public health, and `photon=connected`. |
 
-For live setup diagnostics, run verbose mode:
+Verbose mode streams useful logs while setup waits:
 
 ```bash
 hermes photon quick-setup -v --phone '+<country-code><number>'
 ```
 
-Verbose mode streams new lines from the existing Hermes logs while
-setup waits for local health, public health, and `photon=connected`.
+## Message Flow
 
-`hermes setup gateway` runs the same guided Photon flow when you choose
-Photon from the platform list.
+```mermaid
+flowchart TB
+    subgraph INBOUND["Inbound: iMessage to Hermes"]
+        direction LR
+        IN1["Your iMessage app"] --> IN2["Photon assigned iMessage number"]
+        IN2 --> IN3["Photon Spectrum cloud"]
+        IN3 --> IN4["Registered public webhook URL"]
+        IN4 --> IN5["Cloudflare Quick Tunnel"]
+        IN5 --> IN6["cloudflared on this machine"]
+        IN6 --> IN7["Hermes gateway /photon/webhook"]
+        IN7 --> IN8["Hermes agent receives message"]
+    end
 
-## Manual gateway runtime
+    subgraph OUTBOUND["Outbound: Hermes to iMessage"]
+        direction LR
+        OUT1["Hermes agent reply"] --> OUT2["Hermes gateway send path"]
+        OUT2 --> OUT3["Node sidecar 127.0.0.1:8789"]
+        OUT3 --> OUT4["spectrum-ts SDK"]
+        OUT4 --> OUT5["Photon Spectrum cloud"]
+        OUT5 --> OUT6["Photon assigned iMessage number"]
+        OUT6 --> OUT7["Apple iMessage delivery"]
+        OUT7 --> OUT8["Your iMessage app"]
+    end
 
-`quick-setup` starts or reuses a gateway for the same Hermes home before
-it returns success. For foreground debugging, run the gateway yourself:
-
-```bash
-hermes gateway run -v
+    IN1 ~~~ OUT1
+    IN2 ~~~ OUT2
+    IN3 ~~~ OUT3
+    IN4 ~~~ OUT4
+    IN5 ~~~ OUT5
+    IN6 ~~~ OUT6
+    IN7 ~~~ OUT7
+    IN8 ~~~ OUT8
 ```
 
-That is the gateway process. `-v` prints INFO-level startup and message
-logs in your terminal; press `Ctrl+C` to stop it.
+### Inbound
 
-For always-on use, install the gateway service once and start it in the
-background:
+1. You send an iMessage to Photon's assigned number.
+2. Photon posts a signed webhook to the registered public URL.
+3. Cloudflare forwards that request to the local Hermes gateway.
+4. Hermes verifies `X-Spectrum-Signature`, rejects stale timestamps,
+   dedupes by message id, and dispatches the message to the agent.
+
+### Outbound
+
+1. Hermes produces a reply.
+2. The Python adapter sends the reply to the loopback-only Node sidecar.
+3. The sidecar uses `spectrum-ts` to send through Photon.
+4. Photon delivers the message back to iMessage.
+
+## Why The Sidecar Exists
+
+Hermes is Python, but Photon does not currently expose a public HTTP
+send-message endpoint. The sidecar is a small supervised Node process
+that runs `spectrum-ts` and accepts local-only send/typing requests from
+the Python adapter. When Photon ships an HTTP send endpoint, this can be
+removed.
+
+The sidecar is not the primary inbound path. It may observe SDK inbound
+events, but Hermes treats signed webhooks as the source of truth for
+message delivery.
+
+## Why The Tunnel Exists
+
+Photon must reach your local gateway from the public internet. Cloudflare
+Quick Tunnel gives your laptop a temporary `trycloudflare.com` URL that
+forwards to:
+
+```text
+http://127.0.0.1:8788/photon/webhook
+```
+
+Quick Tunnel URLs can change after restarts. `quick-setup` and the
+gateway register the current URL and avoid deleting user-owned/manual
+webhooks.
+
+For production or a stable URL, register your own reverse proxy instead:
 
 ```bash
+hermes photon webhook register https://YOUR-PUBLIC-URL/photon/webhook
+```
+
+## Runtime Commands
+
+```bash
+hermes photon status
+hermes gateway run -v
 hermes gateway install --force
 hermes gateway start
 ```
 
-`gateway start` controls the installed system service. Do not run it
-and `gateway run -v` at the same time.
+Use `hermes photon status` first. Its final row is the computed next
+step.
 
-Cloudflare Quick Tunnel URLs can change when the tunnel restarts. For
-local Quick Tunnel setups, the Photon adapter starts or reuses the
-managed tunnel when the gateway connects. If you need to repair or
-inspect the tunnel manually, use:
+Use `hermes gateway run -v` for foreground debugging. Use
+`hermes gateway install --force && hermes gateway start` for always-on
+background runtime. Do not run both at the same time.
 
-```bash
-hermes photon webhook tunnel start
-```
+## Logs
 
-`hermes photon status` shows the current readiness state and the next
-command to run.
-
-The `public health` row checks the same public hostname Photon uses for
-webhook delivery. If it is unhealthy, fix that before spending time on
-stale webhook cleanup:
-
-- `HTTP Error 502: Bad Gateway` means Cloudflare reached the tunnel
-  before the local gateway was ready. `hermes photon status` checks local
-  health and service identity before suggesting a repair.
-- `nodename nor servname provided` or `HTTP Error 530` means the current
-  Quick Tunnel hostname is not usable. Run
-  `hermes photon webhook tunnel stop && hermes photon webhook tunnel start`.
-- `registered webhooks : ... unowned stale managed` means another Hermes
-  profile or older run registered extra managed URLs. They are cleanup
-  noise while the current URL is registered; delete old IDs manually
-  later with `hermes photon webhook list` if needed.
-
-## Troubleshooting runtime logs
-
-On gateway startup, Photon logs the active Hermes home. It must match
-the profile where you ran `hermes photon quick-setup`. If quick setup
-wrote credentials under a custom `HERMES_HOME`, start the gateway with
-that same `HERMES_HOME` or the gateway will read a different `.env`.
-
-Quick setup prints these log paths at startup:
-
-```text
-<HERMES_HOME>/logs/gateway.log
-<HERMES_HOME>/logs/errors.log
-<HERMES_HOME>/logs/gateway.error.log
-<HERMES_HOME>/photon/cloudflared.log
-```
-
-If quick setup validates one Photon project but the running gateway
-reports a different project id, setup stops with a runtime project
-mismatch instead of waiting for local health to time out.
-
-If you see `photon-sidecar: observed SDK inbound ...` but do not see
-`[photon] webhook delivery received`, the sidecar has observed the
-message through the SDK stream but Hermes has not received the signed
-webhook it uses for inbound dispatch. Run `hermes photon status` in the
-same profile, then check that the current public webhook URL is
-registered and reachable.
-
-For the full debug checklist, expected endpoints, and May 2026 tunnel
-findings, see `plugins/platforms/photon/DEBUGGING.md`.
-
-## How it works
-
-```
-iMessage phone
-    |
-    v
-Photon Spectrum cloud
-    |
-    | signed webhook through local tunnel
-    v
-Hermes gateway on your computer
-    |
-    | outbound replies through spectrum-ts sidecar
-    v
-Photon Spectrum cloud -> iMessage phone
-```
-
-- Inbound messages arrive as signed Photon webhooks. Hermes verifies
-  `X-Spectrum-Signature` and dedupes on `message.id`.
-- Outbound replies go through the Node sidecar because Photon does not
-  expose a public HTTP send-message endpoint yet.
-- Shared-line conversations can arrive with Spectrum space IDs like
-  `any;-;+<phone>`. The sidecar caches send-capable spaces and falls
-  back to the recipient address when needed.
-
-## Project management
-
-Use these commands when quick setup stops because multiple compatible
-Photon projects exist, or when you intentionally want to bind Hermes to
-a specific project.
+`quick-setup -v` streams the useful Photon/Gateway logs while it waits:
 
 ```bash
+hermes photon quick-setup -v --phone '+<country-code><number>'
+```
+
+Main log files:
+
+| Log | Path | Use |
+|-----|------|-----|
+| Gateway | `~/.hermes/logs/gateway.log` | Gateway startup, Photon connect state, inbound/outbound activity. |
+| Errors | `~/.hermes/logs/errors.log` | Warnings and errors across Hermes runtime. |
+| Gateway errors | `~/.hermes/logs/gateway.error.log` | Gateway-focused warnings and failures. |
+| Cloudflare tunnel | `~/.hermes/photon/cloudflared.log` | Quick Tunnel startup, reconnects, public URL failures. |
+
+Useful commands:
+
+```bash
+hermes logs --follow
+hermes logs --level warning
+hermes photon webhook tunnel logs
+```
+
+On gateway startup, Photon logs the active Hermes home. It should match
+the `HERMES_HOME` where you ran `hermes photon quick-setup`.
+
+## Project And Phone Commands
+
+```bash
+hermes photon allow-phone '+<country-code><number>'
 hermes photon projects list
 hermes photon projects select <dashboard-or-spectrum-project-id>
-hermes photon setup --new-project --phone '+<country-code><number>'
+hermes photon quick-setup --new-project --phone '+<country-code><number>'
 ```
 
 Use `--new-project` only when you intentionally want a separate Photon
-dashboard project.
+dashboard project. It will not fix shared-line exhaustion for a phone
+that Photon has already rate-limited.
 
-## Managed Cloudflare Quick Tunnel
-
-Cloudflare Quick Tunnel is the default local development path. It is
-temporary: the `trycloudflare.com` URL can change when the tunnel
-restarts. The managed command installs or updates a profile-local
-`cloudflared` binary if one is not already on PATH, starts it, captures
-the public URL, registers the Photon webhook, and saves the local webhook
-secret.
+## Tunnel Commands
 
 ```bash
 hermes photon webhook tunnel start
@@ -193,118 +196,48 @@ hermes photon webhook tunnel logs
 hermes photon webhook tunnel stop
 ```
 
-The managed tunnel command can delete stale `trycloudflare.com` webhooks
-it previously created; it leaves user-owned/manual webhook URLs alone.
-The gateway performs the same cleanup when Photon connects, so the
-active gateway profile owns the current managed webhook registration.
+Common public-health failures:
 
-## Manual webhook management
+- `HTTP 502`: Cloudflare reached the tunnel before the gateway was ready.
+- `HTTP 530` or DNS errors: the current Quick Tunnel hostname is stale.
+- Extra stale managed webhooks: cleanup noise unless the current URL is
+  missing or unregistered.
 
-Use manual webhook registration for production, a named Cloudflare
-Tunnel, or any other stable user-owned reverse proxy.
-
-```bash
-hermes photon webhook register https://YOUR-PUBLIC-URL/photon/webhook
-hermes photon webhook list
-hermes photon webhook delete <webhook-id>
-```
-
-Webhook registration is duplicate-aware: if the same URL is already
-registered and `PHOTON_WEBHOOK_SECRET` is present,
-`hermes photon webhook register ...` is a no-op. If the URL exists but
-the local secret is missing, delete or recreate the webhook in the Photon
-dashboard and save the new signing secret locally.
-
-## Status
-
-`hermes photon status` is the fastest way to see the current readiness
-state. The final row is a computed next step.
+## Reset
 
 ```bash
-hermes photon status
+hermes photon reset
+hermes photon reset --all
 ```
 
-## Detailed command reference
+`reset` clears local Photon runtime state and lets `quick-setup` rebuild
+it. It does not delete remote Photon webhooks.
 
-```bash
-hermes photon login
-hermes photon quick-setup --phone '+<country-code><number>'
-hermes photon quick-setup -v --phone '+<country-code><number>'
-hermes photon setup --phone '+<country-code><number>'
-hermes photon setup --new-project --phone '+<country-code><number>'
-hermes photon allow-phone '+<country-code><number>'
-hermes photon projects list
-hermes photon projects select <dashboard-or-spectrum-project-id>
-hermes photon install-sidecar
-hermes photon webhook tunnel start
-hermes photon webhook tunnel status
-hermes photon webhook tunnel logs
-hermes photon webhook tunnel stop
-hermes photon webhook register https://YOUR-PUBLIC-URL/photon/webhook
-hermes photon webhook list
-hermes photon webhook delete <webhook-id>
-hermes photon status
-hermes photon login
-hermes gateway run -v
-hermes gateway install --force
-hermes gateway start
-```
+`reset --all` asks you to type `PHOTON`. It may delete webhooks recorded
+as owned by this Hermes home, clear Photon credentials, clear sender
+allowlist state, stop the tunnel, and remove the dashboard token. It does
+not delete unowned webhooks or another Hermes home's gateway state.
 
 ## Credentials
 
-Photon secrets are stored in `~/.hermes/.env`:
+Photon state lives in `~/.hermes/.env`:
 
 ```bash
 PHOTON_DASHBOARD_TOKEN=...
 PHOTON_PROJECT_ID=...
 PHOTON_PROJECT_SECRET=...
+PHOTON_WEBHOOK_SECRET=...
+PHOTON_WEBHOOK_PUBLIC_URL=...
+PHOTON_ALLOWED_USERS=...
 ```
 
-The dashboard token is used only by `hermes photon` management commands
-such as project listing/creation. The Spectrum project credentials are
-used by the gateway and sidecar at runtime. The per-URL webhook signing
-secret is treated like an API key and lives in `.env` as
-`PHOTON_WEBHOOK_SECRET`.
-The registered public webhook URL is stored as
-`PHOTON_WEBHOOK_PUBLIC_URL` so `hermes photon status` can tell you
-whether the next action is tunnel setup, gateway start, or gateway
-restart.
+See `plugin.yaml` for the full env var list.
 
-## Configuration knobs
+## Current Limitations
 
-All env vars are documented in `plugin.yaml`. The most important are:
-
-| Env var                  | Default            | Meaning                                 |
-|--------------------------|--------------------|-----------------------------------------|
-| `PHOTON_DASHBOARD_TOKEN` | (unset)            | Dashboard token set by `hermes photon login` |
-| `PHOTON_PROJECT_ID`      | (unset)            | Spectrum project ID                     |
-| `PHOTON_PROJECT_SECRET`  | (unset)            | Spectrum project secret (HTTP Basic)    |
-| `PHOTON_WEBHOOK_SECRET`  | (unset)            | Signing secret returned at register     |
-| `PHOTON_WEBHOOK_PUBLIC_URL` | (unset)         | Public webhook URL registered with Photon |
-| `PHOTON_WEBHOOK_TUNNEL_AUTOSTART` | true      | Gateway starts/registers managed tunnel for trycloudflare URLs |
-| `PHOTON_WEBHOOK_TUNNEL_STOP_ON_DISCONNECT` | true | Stop managed tunnel on gateway shutdown |
-| `PHOTON_WEBHOOK_PORT`    | 8788               | Local port for the aiohttp listener     |
-| `PHOTON_WEBHOOK_PATH`    | /photon/webhook    | Path under which the listener mounts    |
-| `PHOTON_SIDECAR_PORT`    | 8789               | Loopback port for sidecar control      |
-| `PHOTON_HOME_CHANNEL`    | (unset)            | Default space ID for cron delivery     |
-| `PHOTON_ALLOWED_USERS`   | (unset)            | Comma-separated E.164 allowlist; setup seeds `--phone` |
-
-## Limitations (current Photon API)
-
-- **Attachments are metadata only.** Inbound webhooks include the
-  filename + MIME type but no download URL. The plugin surfaces a
-  text marker (`[Photon attachment received: …]`) so the agent knows
-  something arrived, but cannot read the bytes.  Photon's docs note
-  an attachment retrieval endpoint is on the roadmap.
-- **Outbound attachments are not supported yet.** Adding them is
-  straightforward once the sidecar wires up `attachment(...)` /
-  `space.send(attachment(...))` from `spectrum-ts`.
-- **Threaded reply metadata is not sent yet.** Hermes may pass a
-  `replyTo` id to the sidecar, but the sidecar currently sends plain
-  text with `space.send(text(...))`; true Spectrum replies need the
-  SDK `reply(...)` content builder and the original message object.
-- **Reactions, message effects, polls** — not exposed yet; the
-  `spectrum-ts` SDK supports them, and the sidecar is the natural
-  place to add them when the agent has reason to use them.
+- Attachments are metadata-only on inbound webhooks.
+- Outbound attachments are not wired yet.
+- True threaded replies need Photon SDK reply support in the sidecar.
+- Reactions, effects, and polls are not exposed through Hermes yet.
 
 [photon]: https://photon.codes/

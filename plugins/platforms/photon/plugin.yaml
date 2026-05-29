@@ -17,12 +17,12 @@ description: >
 author: NousResearch
 requires_env:
   - name: PHOTON_PROJECT_ID
-    description: "Spectrum project ID (set by `hermes photon setup`)"
+    description: "Spectrum project ID (set by `hermes photon quick-setup`)"
     prompt: "Photon Spectrum project ID"
     url: "https://app.photon.codes/"
     password: false
   - name: PHOTON_PROJECT_SECRET
-    description: "Spectrum project secret (set by `hermes photon setup`)"
+    description: "Spectrum project secret (set by `hermes photon quick-setup`)"
     prompt: "Photon Spectrum project secret"
     url: "https://app.photon.codes/"
     password: true

@@ -98,6 +98,9 @@ Advanced/debug commands remain available:
 ```bash
 hermes photon login
 hermes photon status
+hermes photon reset
+hermes photon reset --all
+hermes photon reset all
 ```
 
 Quick setup uses a local Cloudflare Quick Tunnel by default and registers
@@ -107,7 +110,7 @@ the public `trycloudflare.com` webhook URL with Photon.
 Photon. Running setup again is safe: Hermes will not silently duplicate
 a matching dashboard project. If multiple matching projects exist, the
 setup stops and asks you to select one. To intentionally make a
-replacement project, run `hermes photon setup --new-project --phone
+replacement project, run `hermes photon quick-setup --new-project --phone
 '+<country-code><number>'`. To bind Hermes to an existing project, use
 `hermes photon projects list` and `hermes photon projects select
 <project-id>`.
@@ -220,10 +223,10 @@ hermes photon quick-setup -v --phone '+<country-code><number>'
 hermes photon login
 hermes photon projects list
 hermes photon projects select <dashboard-or-spectrum-project-id>
-hermes photon setup --phone '+<country-code><number>'
-hermes photon setup --new-project --phone '+<country-code><number>'
 hermes photon allow-phone '+<country-code><number>'
-hermes photon install-sidecar
+hermes photon reset
+hermes photon reset --all
+hermes photon reset all
 
 # Webhooks.
 hermes photon webhook tunnel start
@@ -276,8 +279,8 @@ Photon iMessage status
 
 Common issues:
 
-- **`sidecar deps : ✗ run hermes photon install-sidecar`** — Node is
-  installed but `spectrum-ts` isn't. Run the suggested command.
+- **`sidecar deps : ✗ ... quick-setup ...`** — Node is installed but
+  `spectrum-ts` is not runnable. Re-run quick setup so Hermes can repair it.
 - **`webhook key : ⚠ unset — verification disabled`** — the
   plugin will accept ANY POST to the webhook URL, which is unsafe.
   Re-run `hermes photon webhook tunnel start` or
@@ -348,8 +351,8 @@ hermes photon webhook delete <webhook-id>   # remove one
 | Variable                  | Default            | Notes                                      |
 |---------------------------|--------------------|--------------------------------------------|
 | `PHOTON_DASHBOARD_TOKEN`  | (unset)            | Set by `hermes photon login`               |
-| `PHOTON_PROJECT_ID`       | (unset)            | Set by `hermes photon setup`               |
-| `PHOTON_PROJECT_SECRET`   | (unset)            | Set by `hermes photon setup`               |
+| `PHOTON_PROJECT_ID`       | (unset)            | Set by `hermes photon quick-setup`         |
+| `PHOTON_PROJECT_SECRET`   | (unset)            | Set by `hermes photon quick-setup`         |
 | `PHOTON_WEBHOOK_SECRET`   | (unset)            | From webhook registration                  |
 | `PHOTON_WEBHOOK_PUBLIC_URL` | (unset)          | Registered public webhook URL              |
 | `PHOTON_WEBHOOK_TUNNEL_AUTOSTART` | `true`    | Gateway starts/registers managed tunnel for trycloudflare URLs |

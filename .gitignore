@@ -77,3 +77,7 @@ models-dev-upstream/
 hermes_cli/tui_dist/*
 hermes_cli/scripts/
 docs/superpowers/*
+
+# Local implementation scratch notes
+plugins/platforms/photon/IMPLEMENTATION_ERRORS.md
+plugins/platforms/photon/IMPLEMENTATION_PROGRESS.md

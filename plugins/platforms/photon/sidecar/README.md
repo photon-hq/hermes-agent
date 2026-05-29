@@ -20,8 +20,8 @@ cd plugins/platforms/photon/sidecar
 npm install
 ```
 
-The Hermes plugin's `hermes photon setup` command runs `npm install`
-here automatically.
+The Hermes plugin's `hermes photon quick-setup` command runs `npm install`
+here automatically when sidecar dependencies are missing.
 
 ## Run standalone
 

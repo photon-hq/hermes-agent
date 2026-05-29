@@ -259,7 +259,7 @@ def setup_lock(
             except (BlockingIOError, OSError, PermissionError):
                 if time.monotonic() >= deadline:
                     raise TimeoutError(
-                        "another `hermes photon setup` process is already running"
+                        "another `hermes photon quick-setup` process is already running"
                     )
                 time.sleep(0.05)
 
@@ -876,6 +876,40 @@ def list_projects(token: str) -> list[Dict[str, Any]]:
     return _project_items(data)
 
 
+def find_dashboard_project_for_spectrum_id(
+    token: str,
+    spectrum_project_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Return the dashboard project that maps to a Spectrum project id.
+
+    ``PHOTON_PROJECT_ID`` is Hermes' canonical runtime id.  Dashboard ids are
+    only a visibility/debug aid, so this helper derives dashboard state from
+    the canonical Spectrum id instead of letting dashboard ids drive runtime.
+    """
+    wanted = str(spectrum_project_id or "").strip()
+    if not wanted:
+        return None
+
+    projects = list_projects(token)
+    normalized = [normalize_project(project) for project in projects]
+    for project in normalized:
+        if str(project.get("spectrum_project_id") or "").strip() == wanted:
+            return project
+
+    # Some dashboard list responses omit nested Spectrum credentials.  When a
+    # dashboard id is available, fetch details and retry against the expanded
+    # project payload before declaring the runtime project invisible.
+    for raw, project in zip(projects, normalized):
+        dashboard_project_id = str(project.get("dashboard_project_id") or "").strip()
+        if not dashboard_project_id:
+            continue
+        details = get_project(token, dashboard_project_id)
+        detailed = normalize_project(_merge_payloads(raw, details))
+        if str(detailed.get("spectrum_project_id") or "").strip() == wanted:
+            return detailed
+    return None
+
+
 def _raise_for_dashboard_status(resp: Any, *, action: str) -> None:
     if resp.status_code in (401, 403):
         detail = _response_error_detail(resp)
@@ -919,6 +953,14 @@ def _project_items(data: Any) -> list[Dict[str, Any]]:
     else:
         items = []
     return [item for item in items if isinstance(item, dict)]
+
+
+def _merge_payloads(*payloads: Dict[str, Any]) -> Dict[str, Any]:
+    merged: Dict[str, Any] = {}
+    for payload in payloads:
+        if isinstance(payload, dict):
+            merged.update(payload)
+    return merged
 
 
 def _first_string(*values: Any) -> Optional[str]:
@@ -1083,6 +1125,110 @@ def create_user(
             f"Photon create-user failed: {data.get('message') or data}"
         )
     return data.get("data") or {}
+
+
+def list_project_users(project_id: str, project_secret: str) -> list[Dict[str, Any]]:
+    """Return Spectrum users scoped to the canonical Photon project id."""
+    if httpx is None:
+        raise RuntimeError("httpx is required for Photon user lookup")
+    url = f"{_spectrum_host()}/projects/{project_id}/users/"
+    resp = httpx.get(
+        url,
+        auth=(project_id, project_secret),
+        timeout=30.0,
+    )
+    resp.raise_for_status()
+    return _user_items(resp.json() or {})
+
+
+def find_project_user_by_phone(
+    project_id: str,
+    project_secret: str,
+    phone_number: str,
+) -> Optional[Dict[str, Any]]:
+    """Find a Spectrum user by phone under one canonical project id."""
+    phone = str(phone_number or "").strip()
+    if not E164_RE.match(phone):
+        raise ValueError(
+            "phone_number must be E.164 (format +<country-code><number>); "
+            f"got {phone_number!r}"
+        )
+    for user in list_project_users(project_id, project_secret):
+        normalized = normalize_user(user)
+        if normalized.get("phone_number") == phone:
+            return normalized
+    return None
+
+
+def normalize_user(user: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize Photon/Spectrum user payload shapes across API revisions."""
+    if not isinstance(user, dict):
+        return {}
+    nested = user.get("data")
+    if isinstance(nested, dict):
+        user = {**nested, **{k: v for k, v in user.items() if k != "data"}}
+    profile = user.get("profile") if isinstance(user.get("profile"), dict) else {}
+    raw = user.get("raw") if isinstance(user.get("raw"), dict) else {}
+    return {
+        "id": _first_string(
+            user.get("id"),
+            user.get("userId"),
+            user.get("user_id"),
+            profile.get("id"),
+        ),
+        "phone_number": _first_string(
+            user.get("phoneNumber"),
+            user.get("phone_number"),
+            user.get("phone"),
+            profile.get("phoneNumber"),
+            profile.get("phone_number"),
+            raw.get("phoneNumber"),
+            raw.get("phone_number"),
+        ),
+        "assigned_phone_number": _first_string(
+            user.get("assignedPhoneNumber"),
+            user.get("assigned_phone_number"),
+            user.get("assignedNumber"),
+            user.get("assigned_number"),
+            profile.get("assignedPhoneNumber"),
+            profile.get("assigned_phone_number"),
+            raw.get("assignedPhoneNumber"),
+            raw.get("assigned_phone_number"),
+        ),
+        "project_id": _first_string(
+            user.get("projectId"),
+            user.get("project_id"),
+            user.get("spectrumProjectId"),
+            user.get("spectrum_project_id"),
+        ),
+        "raw": user,
+    }
+
+
+def _user_items(data: Any) -> list[Dict[str, Any]]:
+    if isinstance(data, list):
+        items = data
+    elif isinstance(data, dict):
+        data_block = data.get("data")
+        if isinstance(data_block, list):
+            items = data_block
+        elif isinstance(data_block, dict):
+            items = (
+                data_block.get("users")
+                or data_block.get("items")
+                or data_block.get("results")
+                or []
+            )
+        else:
+            items = (
+                data.get("users")
+                or data.get("items")
+                or data.get("results")
+                or []
+            )
+    else:
+        items = []
+    return [item for item in items if isinstance(item, dict)]
 
 
 # ---------------------------------------------------------------------------

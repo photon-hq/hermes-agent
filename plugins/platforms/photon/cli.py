@@ -6,13 +6,11 @@ Subcommands:
 
     login              run the device-code OAuth flow
     quick-setup        reconcile Photon setup and prove runtime readiness
-    setup              full first-time setup (login + project + user + sidecar)
     allow-phone        authorize another E.164 sender for Photon gateway use
     status             show Photon setup/runtime invariant state
-    install-sidecar    npm install inside plugins/platforms/photon/sidecar/
+    reset              clear local Photon state, or --all for owned remote cleanup
     webhook register   register the local webhook URL with Photon
     webhook list       list registered webhooks
-    webhook cleanup    delete stale managed trycloudflare.com webhooks
     webhook delete     delete a webhook by id
     webhook tunnel     manage the local Cloudflare Quick Tunnel
 """
@@ -20,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import hashlib
 import json
 import os
 import plistlib
@@ -42,6 +41,21 @@ _SIDECAR_DIR = Path(__file__).parent / "sidecar"
 _MIN_SPECTRUM_TS_VERSION = (1, 7, 2)
 _PHONE_FORMAT = "+<country-code><number>"
 _PHONE_ARG_PLACEHOLDER = f"'{_PHONE_FORMAT}'"
+_FINGERPRINT_VERSION = "sha256:16"
+_PHOTON_RUNTIME_RESET_ENV_KEYS = (
+    "PHOTON_PROJECT_ID",
+    "PHOTON_PROJECT_SECRET",
+    "PHOTON_WEBHOOK_SECRET",
+    "PHOTON_WEBHOOK_PUBLIC_URL",
+)
+_PHOTON_ALL_RESET_ENV_KEYS = (
+    *_PHOTON_RUNTIME_RESET_ENV_KEYS,
+    "PHOTON_DASHBOARD_TOKEN",
+    "PHOTON_ALLOWED_USERS",
+    "PHOTON_ALLOW_ALL_USERS",
+    "PHOTON_HOME_CHANNEL",
+    "PHOTON_HOME_CHANNEL_NAME",
+)
 
 
 @dataclass
@@ -82,6 +96,7 @@ class _PhotonSetupContext:
     webhook_path: str
     project_id: str = ""
     project_secret: str = ""
+    dashboard_project_name: str = ""
     operator_phone: Optional[str] = None
     assigned_phone_number: Optional[str] = None
     webhook_url: str = ""
@@ -108,7 +123,7 @@ class _PhotonSetupContext:
 
     def outcome(self) -> _SetupOutcome:
         return _SetupOutcome(
-            project_name=self.project_name,
+            project_name=self.dashboard_project_name or self.project_name,
             operator_phone=self.operator_phone,
             assigned_phone_number=self.assigned_phone_number,
         )
@@ -166,18 +181,6 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     p_quick.add_argument("-v", "--verbose", action="store_true",
                          help="Stream existing gateway/Photon logs while setup waits")
 
-    p_setup = subs.add_parser("setup", help="First-time setup (login + project + user + sidecar)")
-    p_setup.add_argument("--project-name", default=None, help="Project name (default: 'Hermes Agent')")
-    p_setup.add_argument("--phone", default=None, help=f"Your E.164 phone number (format: {_PHONE_FORMAT})")
-    p_setup.add_argument("--first-name", default=None)
-    p_setup.add_argument("--last-name", default=None)
-    p_setup.add_argument("--email", default=None)
-    p_setup.add_argument("--no-browser", action="store_true")
-    p_setup.add_argument("--new-project", action="store_true",
-                         help="Create a new Photon dashboard project instead of adopting an existing one")
-    p_setup.add_argument("--skip-sidecar-install", action="store_true",
-                         help="Skip `npm install` inside the sidecar directory")
-
     p_allow = subs.add_parser(
         "allow-phone",
         help="Allow a phone number to control Hermes over Photon",
@@ -185,8 +188,19 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     p_allow.add_argument("phone", help=f"E.164 phone number (format: {_PHONE_FORMAT})")
 
     subs.add_parser("status", help="Show Photon setup/runtime invariant state")
-    subs.add_parser("diagnose-auth", help="Print sanitized Photon auth diagnostics")
-    subs.add_parser("install-sidecar", help="Run npm install inside the sidecar directory")
+    p_reset = subs.add_parser("reset", help="Reset Photon setup state")
+    p_reset.add_argument(
+        "--all",
+        action="store_true",
+        help="After confirmation, delete owned Photon webhooks and clear auth state",
+    )
+    p_reset.add_argument(
+        "scope",
+        nargs="?",
+        choices=("all",),
+        metavar="all",
+        help="Compatibility alias for --all",
+    )
 
     p_projects = subs.add_parser("projects", help="List or select Photon projects")
     project_subs = p_projects.add_subparsers(dest="photon_projects_command", required=True)
@@ -199,10 +213,6 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     p_hook_reg = hook_subs.add_parser("register", help="Register a webhook URL")
     p_hook_reg.add_argument("url", help="Publicly reachable URL Photon should POST to")
     hook_subs.add_parser("list", help="List registered webhooks for the current project")
-    hook_subs.add_parser(
-        "cleanup",
-        help="Delete stale managed trycloudflare.com webhooks for the current project",
-    )
     p_hook_del = hook_subs.add_parser("delete", help="Delete a webhook by id")
     p_hook_del.add_argument("webhook_id")
     p_tunnel = hook_subs.add_parser("tunnel", help="Manage a local Cloudflare Quick Tunnel")
@@ -227,16 +237,12 @@ def dispatch(args: argparse.Namespace) -> int:
         return _cmd_login(args)
     if sub == "quick-setup":
         return _cmd_quick_setup(args)
-    if sub == "setup":
-        return _cmd_setup(args)
     if sub == "allow-phone":
         return _cmd_allow_phone(args)
     if sub == "status":
         return _cmd_status(args)
-    if sub == "diagnose-auth":
-        return _cmd_diagnose_auth(args)
-    if sub == "install-sidecar":
-        return _cmd_install_sidecar(args)
+    if sub == "reset":
+        return _cmd_reset(args)
     if sub == "projects":
         return _cmd_projects(args)
     if sub == "webhook":
@@ -334,14 +340,194 @@ def _cmd_quick_setup(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_reset(args: argparse.Namespace) -> int:
+    reset_all = bool(
+        getattr(args, "all", False)
+        or getattr(args, "scope", None) == "all"
+    )
+    hermes_home = photon_tunnel.hermes_home()
+    env_path = photon_auth._env_path()
+    project_id, project_secret = photon_auth.load_project_credentials()
+
+    if reset_all and not _confirm_reset_all(hermes_home, project_id or ""):
+        print("Photon reset aborted.")
+        return 1
+
+    print("Photon reset")
+    print("────────────")
+    print(f"  Hermes home : {hermes_home}")
+    print(f"  env path    : {env_path}")
+    if project_id:
+        print(f"  project     : {project_id}")
+    else:
+        print("  project     : ✗ none configured")
+
+    stop_result = photon_tunnel.stop()
+    print(f"  tunnel      : {stop_result.get('message') or 'checked'}")
+
+    if reset_all:
+        if not _delete_owned_webhooks_for_reset(project_id or "", project_secret or ""):
+            print(
+                "Photon reset stopped before clearing local state so owned webhook "
+                "records are retained.",
+                file=sys.stderr,
+            )
+            return 1
+        _clear_photon_env_keys(_PHOTON_ALL_RESET_ENV_KEYS)
+        _clear_active_home_claim()
+        _clear_tunnel_state(preserve_owned_webhooks=False)
+        print("  auth        : dashboard token removed if it was present")
+        print("Photon reset complete.")
+        return 0
+
+    _clear_photon_env_keys(_PHOTON_RUNTIME_RESET_ENV_KEYS)
+    _clear_active_home_claim()
+    _clear_tunnel_state(preserve_owned_webhooks=True)
+    print("  auth        : dashboard token kept")
+    print("Photon local reset complete.")
+    print("  Remote Photon webhooks were not deleted.")
+    return 0
+
+
+def _confirm_reset_all(hermes_home: Path, project_id: str) -> bool:
+    print(_reset_all_confirmation_text(hermes_home, project_id))
+    try:
+        answer = input().strip()
+    except EOFError:
+        return False
+    return answer == "PHOTON"
+
+
+def _reset_all_confirmation_text(hermes_home: Path, project_id: str) -> str:
+    project_label = project_id or "(none configured)"
+    return "\n".join([
+        "This will reset Photon for Hermes home:",
+        f"  {hermes_home}",
+        "",
+        "Project:",
+        f"  {project_label}",
+        "",
+        (
+            "It may delete owned Photon webhooks, clear local Photon credentials, "
+            "stop the managed tunnel, and remove the dashboard token."
+        ),
+        (
+            "It will not delete unowned webhooks or another Hermes home's "
+            "gateway state."
+        ),
+        "",
+        "Type PHOTON to continue:",
+    ])
+
+
+def _delete_owned_webhooks_for_reset(project_id: str, project_secret: str) -> bool:
+    owned_ids = photon_tunnel.owned_webhook_ids()
+    if not owned_ids:
+        print("  webhooks    : no owned Photon webhooks recorded")
+        return True
+
+    if not (project_id and project_secret):
+        print(
+            "  webhooks    : cannot delete owned webhooks; missing project credentials",
+            file=sys.stderr,
+        )
+        return False
+
+    try:
+        hooks = photon_auth.list_webhooks(project_id, project_secret)
+    except Exception as e:
+        print(f"  webhooks    : could not list Photon webhooks: {e}", file=sys.stderr)
+        return False
+
+    hooks_by_id = {_webhook_id(hook): hook for hook in hooks if _webhook_id(hook)}
+    deleted = 0
+    missing = 0
+    for webhook_id in sorted(owned_ids):
+        if webhook_id not in hooks_by_id:
+            photon_tunnel.forget_owned_webhook(webhook_id)
+            missing += 1
+            continue
+        try:
+            photon_auth.delete_webhook(
+                project_id,
+                project_secret,
+                webhook_id=webhook_id,
+            )
+        except Exception as e:
+            print(
+                f"  webhooks    : could not delete owned webhook {webhook_id}: {e}",
+                file=sys.stderr,
+            )
+            return False
+        photon_tunnel.forget_owned_webhook(webhook_id)
+        deleted += 1
+
+    detail = f"deleted {deleted} owned Photon webhook"
+    if deleted != 1:
+        detail += "s"
+    if missing:
+        detail += f"; forgot {missing} missing owned id"
+        if missing != 1:
+            detail += "s"
+    print(f"  webhooks    : {detail}")
+    return True
+
+
+def _clear_photon_env_keys(keys: tuple[str, ...]) -> None:
+    removed = [key for key in keys if _remove_env_value(key)]
+    if removed:
+        print(f"  env         : removed {', '.join(removed)}")
+    else:
+        print("  env         : no Photon env keys needed removal")
+
+
+def _clear_active_home_claim() -> None:
+    mismatch = photon_tunnel.active_home_mismatch()
+    if mismatch:
+        owner, current = mismatch
+        print(
+            "  owner claim : kept; active-home belongs to another Hermes home "
+            f"({owner}, current {current})"
+        )
+        return
+
+    path = photon_tunnel.active_home_path()
+    try:
+        if path.exists():
+            path.unlink()
+            print(f"  owner claim : removed {path}")
+        else:
+            print("  owner claim : none recorded")
+    except OSError as e:
+        print(f"  owner claim : could not remove {path}: {e}", file=sys.stderr)
+
+
+def _clear_tunnel_state(*, preserve_owned_webhooks: bool) -> None:
+    path = photon_tunnel.state_path()
+    state = photon_tunnel.load_state()
+    owned = state.get("owned_webhooks") if isinstance(state, dict) else None
+    if preserve_owned_webhooks and owned:
+        photon_tunnel.save_state({"owned_webhooks": owned})
+        print("  state       : cleared tunnel runtime state; kept owned webhook records")
+        return
+
+    try:
+        if path.exists():
+            path.unlink()
+            print(f"  state       : removed {path}")
+        else:
+            print("  state       : no tunnel state file")
+    except OSError as e:
+        print(f"  state       : could not remove {path}: {e}", file=sys.stderr)
+
+
 def _run_quick_setup_reconciler(ctx: _PhotonSetupContext) -> None:
     token = _ensure_dashboard_auth(ctx)
     _ensure_spectrum_project(ctx, token)
     _ensure_active_home_available(ctx)
     _ensure_operator_phone(ctx)
     _ensure_sidecar_ready(ctx)
-    _ensure_gateway_local_runtime(ctx)
-    _ensure_public_webhook_path(ctx)
+    _ensure_public_webhook_path(ctx, wait_for_health=False)
     webhook_result = _ensure_current_webhook_registered(ctx)
     ctx.registered_hooks = webhook_result.hooks
     ctx.runtime_secrets_changed = (
@@ -349,10 +535,21 @@ def _run_quick_setup_reconciler(ctx: _PhotonSetupContext) -> None:
         or webhook_result.secret_changed
         or webhook_result.public_url_changed
     )
-    if ctx.runtime_secrets_changed:
-        _restart_current_home_gateway(ctx)
-        _wait_for_local_health(ctx, reason="gateway restart after Photon secret update")
-        _wait_for_public_health(ctx, reason="gateway restart after Photon secret update")
+    _ensure_gateway_local_runtime(ctx)
+    identity_restarted = _reconcile_gateway_runtime_identity(
+        ctx,
+        require_webhook_secret=True,
+        reason="post-webhook runtime identity verification",
+    )
+    if identity_restarted:
+        _wait_for_local_health(
+            ctx,
+            reason="gateway restart after Photon runtime identity reconciliation",
+        )
+        _wait_for_public_health(
+            ctx,
+            reason="gateway restart after Photon runtime identity reconciliation",
+        )
     else:
         _wait_for_public_health(ctx, reason="post-webhook verification")
     _wait_for_photon_connected(ctx)
@@ -451,6 +648,7 @@ def _ensure_spectrum_project(ctx: _PhotonSetupContext, token: str) -> None:
             ctx.project_id = existing_id
             ctx.project_secret = existing_secret
             ctx.registered_hooks = hooks
+            _ensure_dashboard_project_maps_to_spectrum(ctx, token)
             print("  ✓ stored Spectrum credentials validated")
             return
 
@@ -495,7 +693,65 @@ def _ensure_spectrum_project(ctx: _PhotonSetupContext, token: str) -> None:
     ctx.project_id = project_id
     ctx.project_secret = project_secret
     ctx.registered_hooks = hooks
+    _ensure_dashboard_project_maps_to_spectrum(ctx, token)
     print("  ✓ Spectrum credentials validated")
+
+
+def _ensure_dashboard_project_maps_to_spectrum(
+    ctx: _PhotonSetupContext,
+    token: str,
+) -> dict[str, Any]:
+    """Verify the logged-in dashboard account can see ctx.project_id.
+
+    Hermes treats ``PHOTON_PROJECT_ID`` as canonical.  This check only proves
+    the Dashboard project the operator sees maps back to that runtime id.
+    """
+    try:
+        project = photon_auth.find_dashboard_project_for_spectrum_id(
+            token,
+            ctx.project_id,
+        )
+    except photon_auth.PhotonDashboardAuthError as e:
+        raise _failed_invariant(
+            ctx,
+            step="dashboard project mapping",
+            summary="Photon dashboard token could not verify the runtime project",
+            expected="dashboard project list is readable for the current account",
+            observed=f"{type(e).__name__}: {e}",
+            evidence={"project_id": ctx.project_id},
+            repair="log in to the Photon dashboard account that owns this project, then rerun quick-setup",
+        ) from e
+    except Exception as e:
+        raise _failed_invariant(
+            ctx,
+            step="dashboard project mapping",
+            summary="could not verify the dashboard project for the runtime project",
+            expected="dashboard project list contains the current PHOTON_PROJECT_ID",
+            observed=f"{type(e).__name__}: {e}",
+            evidence={"project_id": ctx.project_id},
+            repair="check Photon dashboard API access, then rerun quick-setup",
+        ) from e
+
+    if not project:
+        raise _failed_invariant(
+            ctx,
+            step="dashboard project mapping",
+            summary="stored Spectrum project is not visible in the Photon dashboard account",
+            expected="one dashboard project maps to the current PHOTON_PROJECT_ID",
+            observed={
+                "project_id": ctx.project_id,
+                "project_name": ctx.project_name,
+            },
+            evidence={"dashboard_host": _dashboard_url().rstrip("/")},
+            repair="select a project visible in this dashboard account, or rerun quick-setup with --new-project",
+        )
+
+    ctx.dashboard_project_name = str(project.get("name") or ctx.project_name)
+    print(
+        "  ✓ dashboard project maps to runtime project "
+        f"({ctx.dashboard_project_name})"
+    )
+    return project
 
 
 def _ensure_active_home_available(ctx: _PhotonSetupContext) -> None:
@@ -544,8 +800,9 @@ def _ensure_operator_phone(ctx: _PhotonSetupContext) -> None:
             repair=f"rerun with a phone number like {_PHONE_ARG_PLACEHOLDER}",
         )
 
+    user: dict[str, Any] = {}
     try:
-        user = photon_auth.create_user(
+        created_user = photon_auth.create_user(
             ctx.project_id,
             ctx.project_secret,
             phone_number=phone,
@@ -555,24 +812,37 @@ def _ensure_operator_phone(ctx: _PhotonSetupContext) -> None:
         )
     except Exception as e:
         if _error_looks_like_existing_user(e):
-            print("  ✓ phone already exists as a Spectrum user")
-            user = {}
+            print("  phone already exists; verifying it belongs to the current Photon project")
+            user = _require_project_user_by_phone(ctx, phone, cause=e)
+            print("  ✓ phone verified in the current Photon project")
         else:
             raise _failed_invariant(
                 ctx,
                 step="Spectrum user",
                 summary="could not create or verify the Spectrum user",
                 expected="operator phone exists as a shared Spectrum iMessage user",
-                observed=f"{type(e).__name__}: {e}",
+                observed=_format_exception_with_http_detail(e),
                 evidence={"project_id": ctx.project_id, "http_status": _http_status(e)},
                 repair="verify the phone number in Photon, then rerun quick-setup",
             ) from e
+    else:
+        # Creation is scoped to PHOTON_PROJECT_ID, so a 2xx response proves the
+        # user was created under the canonical project.  A follow-up lookup is
+        # best-effort so we can print the assigned iMessage number when Photon
+        # exposes it outside the create response.
+        user = photon_auth.normalize_user(created_user)
+        looked_up = _lookup_project_user_by_phone(ctx, phone)
+        if looked_up:
+            user = looked_up
 
     ctx.assigned_phone_number = _extract_assigned_phone_number(user)
     if ctx.assigned_phone_number:
         print(f"  ✓ assigned Photon iMessage number: {ctx.assigned_phone_number}")
     else:
-        print("  ✓ Spectrum user is present; Photon did not return the assigned iMessage number")
+        print(
+            "  ✓ Spectrum user is verified in the current project; "
+            "Photon did not return the assigned iMessage number"
+        )
     if not _ensure_operator_phone_allowed(phone):
         raise _failed_invariant(
             ctx,
@@ -582,6 +852,66 @@ def _ensure_operator_phone(ctx: _PhotonSetupContext) -> None:
             observed=_photon_sender_access_status(),
             repair=f"run `hermes photon allow-phone {phone}`",
         )
+
+
+def _lookup_project_user_by_phone(
+    ctx: _PhotonSetupContext,
+    phone: str,
+) -> Optional[dict[str, Any]]:
+    try:
+        return photon_auth.find_project_user_by_phone(
+            ctx.project_id,
+            ctx.project_secret,
+            phone,
+        )
+    except Exception:
+        return None
+
+
+def _require_project_user_by_phone(
+    ctx: _PhotonSetupContext,
+    phone: str,
+    *,
+    cause: BaseException,
+) -> dict[str, Any]:
+    try:
+        user = photon_auth.find_project_user_by_phone(
+            ctx.project_id,
+            ctx.project_secret,
+            phone,
+        )
+    except Exception as e:
+        raise _failed_invariant(
+            ctx,
+            step="Spectrum user",
+            summary="phone exists, but Hermes could not verify it in the current Photon project",
+            expected="current PHOTON_PROJECT_ID user list contains the requested phone",
+            observed=f"{type(e).__name__}: {e}",
+            evidence={
+                "project_id": ctx.project_id,
+                "phone": phone,
+                "create_user_error": _format_exception_with_http_detail(cause),
+                "http_status": _http_status(cause),
+            },
+            repair="verify the phone under the Photon project that matches this project id, then rerun quick-setup",
+        ) from e
+
+    if user:
+        return user
+    raise _failed_invariant(
+        ctx,
+        step="Spectrum user",
+        summary="phone exists, but not in the current Photon project",
+        expected="current PHOTON_PROJECT_ID user list contains the requested phone",
+        observed={
+            "project_id": ctx.project_id,
+            "phone": phone,
+            "create_user_error": _format_exception_with_http_detail(cause),
+            "http_status": _http_status(cause),
+        },
+        evidence={"dashboard_project": ctx.dashboard_project_name or ctx.project_name},
+        repair="attach this phone to the selected Photon project or create a new Photon project for Hermes",
+    )
 
 
 def _ensure_sidecar_ready(ctx: _PhotonSetupContext) -> None:
@@ -610,7 +940,7 @@ def _ensure_sidecar_ready(ctx: _PhotonSetupContext) -> None:
             expected="spectrum-ts dependency is installed and current",
             observed=status,
             evidence={"sidecar_dir": str(_SIDECAR_DIR)},
-            repair="rerun without `--skip-sidecar-install` or run `hermes photon install-sidecar`",
+            repair="rerun quick-setup without `--skip-sidecar-install`",
         )
 
     rc = _install_sidecar()
@@ -643,7 +973,18 @@ def _ensure_gateway_local_runtime(ctx: _PhotonSetupContext) -> None:
     service = _inspect_gateway_service_identity(ctx)
     _fail_if_service_home_mismatch(ctx, service)
     runtime = _inspect_gateway_runtime()
-    _assert_runtime_project_matches(ctx, runtime)
+    if runtime.get("running"):
+        restarted = _reconcile_gateway_runtime_identity(
+            ctx,
+            require_webhook_secret=False,
+            reason="pre-health runtime identity verification",
+        )
+        if restarted:
+            _wait_for_local_health(
+                ctx,
+                reason="gateway restart after Photon runtime identity reconciliation",
+            )
+            return
     local = _check_local_health(ctx)
     ctx.local_health = local
     if local.ok and runtime.get("running"):
@@ -678,15 +1019,25 @@ def _ensure_gateway_local_runtime(ctx: _PhotonSetupContext) -> None:
 
     _start_current_home_gateway(ctx, service)
     _wait_for_local_health(ctx, reason="gateway startup")
+    _wait_for_runtime_identity(
+        ctx,
+        require_webhook_secret=False,
+        reason="gateway startup",
+    )
 
 
-def _ensure_public_webhook_path(ctx: _PhotonSetupContext) -> None:
-    print("[tunnel] Ensuring public webhook health...")
+def _ensure_public_webhook_path(
+    ctx: _PhotonSetupContext,
+    *,
+    wait_for_health: bool = True,
+) -> None:
+    print("[tunnel] Ensuring public webhook path...")
     configured = (_get_env_value("PHOTON_WEBHOOK_PUBLIC_URL") or "").strip()
     if configured and not photon_tunnel.is_trycloudflare_url(configured):
         ctx.webhook_url = configured
         print(f"  using user-owned public webhook URL: {configured}")
-        _wait_for_public_health(ctx, reason="user-owned public URL")
+        if wait_for_health:
+            _wait_for_public_health(ctx, reason="user-owned public URL")
         return
 
     result = photon_tunnel.start(on_install=print)
@@ -707,7 +1058,8 @@ def _ensure_public_webhook_path(ctx: _PhotonSetupContext) -> None:
     ctx.webhook_url = result.webhook_url
     action = "reused" if result.reused else "started"
     print(f"  ✓ {action} managed tunnel: {result.webhook_url}")
-    _wait_for_public_health(ctx, reason="managed tunnel startup")
+    if wait_for_health:
+        _wait_for_public_health(ctx, reason="managed tunnel startup")
 
 
 def _ensure_current_webhook_registered(
@@ -871,6 +1223,23 @@ def _wait_for_photon_connected(ctx: _PhotonSetupContext, timeout_seconds: float 
             .get("state")
         )
         if photon_state == "connected":
+            comparison = _runtime_identity_comparison(
+                ctx,
+                runtime,
+                require_webhook_secret=True,
+            )
+            if not comparison.get("matches"):
+                raise _runtime_identity_failure(
+                    ctx,
+                    summary=(
+                        "gateway reported photon=connected with a stale "
+                        "Photon runtime identity"
+                    ),
+                    comparison=comparison,
+                    runtime=runtime,
+                    reason="final photon=connected verification",
+                    repair="restart or repair the current-home gateway, then rerun quick-setup",
+                )
             print("  ✓ gateway runtime reports photon=connected")
             return
         if photon_state == "fatal":
@@ -1090,6 +1459,277 @@ def _finalize_failed_invariant_logs(
         error.logs = _collect_relevant_log_tail(ctx)
 
 
+def _secret_fingerprint(value: str) -> str:
+    if not value:
+        return ""
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+    return f"sha256:{digest}"
+
+
+def _expected_runtime_identity(
+    ctx: _PhotonSetupContext,
+    *,
+    require_webhook_secret: bool,
+) -> dict[str, str]:
+    expected = {
+        "project_id": ctx.project_id,
+        "project_secret_fingerprint": _secret_fingerprint(ctx.project_secret),
+    }
+    webhook_secret = (_get_env_value("PHOTON_WEBHOOK_SECRET") or "").strip()
+    if webhook_secret or require_webhook_secret:
+        expected["webhook_secret_fingerprint"] = _secret_fingerprint(webhook_secret)
+    return {
+        key: value
+        for key, value in expected.items()
+        if value or key == "webhook_secret_fingerprint"
+    }
+
+
+def _runtime_photon_field(runtime: dict[str, Any], *keys: str) -> str:
+    photon = _runtime_photon_status(runtime)
+    for key in keys:
+        value = photon.get(key)
+        if value:
+            return str(value)
+    metadata = photon.get("metadata")
+    if isinstance(metadata, dict):
+        for key in keys:
+            value = metadata.get(key)
+            if value:
+                return str(value)
+    return ""
+
+
+def _observed_runtime_identity(runtime: dict[str, Any]) -> dict[str, str]:
+    observed = {
+        "project_id": _runtime_photon_project_id(runtime),
+        "project_secret_fingerprint": _runtime_photon_field(
+            runtime,
+            "project_secret_fingerprint",
+            "projectSecretFingerprint",
+        ),
+        "webhook_secret_fingerprint": _runtime_photon_field(
+            runtime,
+            "webhook_secret_fingerprint",
+            "webhookSecretFingerprint",
+        ),
+        "credential_fingerprint_version": _runtime_photon_field(
+            runtime,
+            "credential_fingerprint_version",
+            "credentialFingerprintVersion",
+        ),
+    }
+    return {key: value for key, value in observed.items() if value}
+
+
+def _runtime_identity_comparison(
+    ctx: _PhotonSetupContext,
+    runtime: dict[str, Any],
+    *,
+    require_webhook_secret: bool,
+) -> dict[str, Any]:
+    expected = _expected_runtime_identity(
+        ctx,
+        require_webhook_secret=require_webhook_secret,
+    )
+    observed = _observed_runtime_identity(runtime)
+    missing_expected = [
+        key for key, value in expected.items()
+        if key.endswith("_fingerprint") and not value
+    ]
+    missing_observed = {
+        key: expected_value
+        for key, expected_value in expected.items()
+        if expected_value and not observed.get(key)
+    }
+    mismatches = {
+        key: {
+            "expected": expected_value,
+            "observed": observed.get(key, ""),
+        }
+        for key, expected_value in expected.items()
+        if expected_value
+        and observed.get(key)
+        and observed.get(key) != expected_value
+    }
+    return {
+        "expected": expected,
+        "observed": observed,
+        "missing_expected": missing_expected,
+        "missing_observed": missing_observed,
+        "mismatches": mismatches,
+        "matches": not missing_expected and not missing_observed and not mismatches,
+    }
+
+
+def _runtime_identity_has_stale_evidence(
+    comparison: dict[str, Any],
+    runtime: dict[str, Any],
+) -> bool:
+    if comparison.get("mismatches") or comparison.get("missing_expected"):
+        return True
+    if comparison.get("missing_observed") and _runtime_photon_status(runtime):
+        return True
+    status = runtime.get("status") or {}
+    if (
+        comparison.get("missing_observed")
+        and status.get("gateway_state") == "running"
+        and not _runtime_photon_status(runtime)
+    ):
+        return True
+    return False
+
+
+def _runtime_identity_failure(
+    ctx: _PhotonSetupContext,
+    *,
+    summary: str,
+    comparison: dict[str, Any],
+    runtime: dict[str, Any],
+    reason: str,
+    repair: str,
+) -> _FailedInvariant:
+    local = ctx.local_health or _check_local_health(ctx)
+    return _failed_invariant(
+        ctx,
+        step="gateway runtime identity",
+        summary=summary,
+        expected="gateway runtime Photon identity matches quick-setup validated env state",
+        observed={
+            "expected_runtime_identity": comparison.get("expected", {}),
+            "observed_runtime_identity": comparison.get("observed", {}),
+            "missing_expected": comparison.get("missing_expected", []),
+            "missing_observed": comparison.get("missing_observed", {}),
+            "mismatches": comparison.get("mismatches", {}),
+        },
+        evidence={
+            "reason": reason,
+            "fingerprint_version": _FINGERPRINT_VERSION,
+            "service": _inspect_gateway_service_identity(ctx),
+            "runtime": runtime,
+            "gateway_runtime_status_path": runtime.get("status_path", ""),
+            "local_health": _health_evidence(local),
+            "public_health": _public_health_evidence(ctx.public_health),
+            "port_owner": _port_owner(ctx.webhook_port),
+        },
+        repair=repair,
+    )
+
+
+def _wait_for_runtime_identity(
+    ctx: _PhotonSetupContext,
+    *,
+    require_webhook_secret: bool,
+    reason: str,
+    timeout_seconds: float = 60.0,
+) -> dict[str, Any]:
+    print("[runtime] Verifying gateway loaded reconciled Photon credentials...")
+    deadline = time.monotonic() + timeout_seconds
+    last_runtime: dict[str, Any] = {}
+    last_comparison: dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        runtime = _inspect_gateway_runtime()
+        comparison = _runtime_identity_comparison(
+            ctx,
+            runtime,
+            require_webhook_secret=require_webhook_secret,
+        )
+        last_runtime = runtime
+        last_comparison = comparison
+        if comparison.get("matches"):
+            print("  ✓ gateway runtime identity matches reconciled Photon credentials")
+            return runtime
+        _stream_quick_setup_logs(ctx)
+        time.sleep(1)
+
+    raise _runtime_identity_failure(
+        ctx,
+        summary="gateway did not report the Photon identity quick-setup validated",
+        comparison=last_comparison,
+        runtime=last_runtime,
+        reason=reason,
+        repair="restart or repair the current-home gateway, then rerun quick-setup",
+    )
+
+
+def _reconcile_gateway_runtime_identity(
+    ctx: _PhotonSetupContext,
+    *,
+    require_webhook_secret: bool,
+    reason: str,
+    timeout_seconds: float = 60.0,
+) -> bool:
+    service = _inspect_gateway_service_identity(ctx)
+    _fail_if_service_home_mismatch(ctx, service)
+    deadline = time.monotonic() + timeout_seconds
+    last_runtime = _inspect_gateway_runtime()
+    last_comparison = _runtime_identity_comparison(
+        ctx,
+        last_runtime,
+        require_webhook_secret=require_webhook_secret,
+    )
+    while time.monotonic() < deadline:
+        if last_comparison.get("matches"):
+            return False
+        if last_runtime.get("running") and _runtime_identity_has_stale_evidence(
+            last_comparison,
+            last_runtime,
+        ):
+            break
+        _stream_quick_setup_logs(ctx)
+        time.sleep(1)
+        last_runtime = _inspect_gateway_runtime()
+        last_comparison = _runtime_identity_comparison(
+            ctx,
+            last_runtime,
+            require_webhook_secret=require_webhook_secret,
+        )
+
+    if not last_runtime.get("running"):
+        raise _runtime_identity_failure(
+            ctx,
+            summary=(
+                "gateway runtime identity could not be verified because the "
+                "gateway is not running"
+            ),
+            comparison=last_comparison,
+            runtime=last_runtime,
+            reason=reason,
+            repair="start the current-home gateway, then rerun quick-setup",
+        )
+
+    _restart_current_home_gateway(ctx)
+    try:
+        _wait_for_runtime_identity(
+            ctx,
+            require_webhook_secret=require_webhook_secret,
+            reason=f"{reason}; restart after stale Photon runtime identity",
+            timeout_seconds=timeout_seconds,
+        )
+    except _FailedInvariant as exc:
+        after_runtime = _inspect_gateway_runtime()
+        after_comparison = _runtime_identity_comparison(
+            ctx,
+            after_runtime,
+            require_webhook_secret=require_webhook_secret,
+        )
+        raise _runtime_identity_failure(
+            ctx,
+            summary=(
+                "gateway restarted but still did not load reconciled Photon "
+                "runtime identity"
+            ),
+            comparison=after_comparison,
+            runtime=after_runtime,
+            reason=reason,
+            repair=(
+                "inspect the current-home gateway service environment and "
+                "Photon .env, then rerun quick-setup"
+            ),
+        ) from exc
+    return True
+
+
 def _runtime_photon_status(runtime: dict[str, Any]) -> dict[str, Any]:
     status = runtime.get("status") or {}
     platforms = status.get("platforms") or {}
@@ -1166,7 +1806,6 @@ def _wait_for_local_health(
     deadline = time.monotonic() + timeout_seconds
     last = _check_local_health(ctx)
     while time.monotonic() < deadline:
-        _assert_runtime_project_matches(ctx, _inspect_gateway_runtime())
         if last.ok:
             ctx.local_health = last
             print(f"  ✓ local health reachable ({last.url})")
@@ -1202,7 +1841,6 @@ def _wait_for_public_health(
     deadline = time.monotonic() + timeout_seconds
     last = photon_tunnel.check_public_health(ctx.webhook_url)
     while time.monotonic() < deadline:
-        _assert_runtime_project_matches(ctx, _inspect_gateway_runtime())
         ctx.public_health = last
         if last[0]:
             print(f"  ✓ public health reachable ({last[1]})")
@@ -1341,10 +1979,32 @@ def _remove_env_value(key: str) -> bool:
 
 def _error_looks_like_existing_user(exc: BaseException) -> bool:
     status = _http_status(exc)
+    detail = _http_error_detail(exc).lower()
     if status == 409:
-        return True
-    detail = str(exc).lower()
-    return "already" in detail and "user" in detail
+        return (
+            ("already" in detail or "exist" in detail)
+            and ("user" in detail or "phone" in detail)
+        )
+    fallback = str(exc).lower()
+    return "already" in fallback and "user" in fallback
+
+
+def _http_error_detail(exc: BaseException) -> str:
+    response = getattr(exc, "response", None)
+    if response is None:
+        return ""
+    try:
+        return photon_auth._response_error_detail(response)  # type: ignore[attr-defined]
+    except Exception:
+        return str(getattr(response, "text", "") or "").strip()[:200]
+
+
+def _format_exception_with_http_detail(exc: BaseException) -> str:
+    formatted = f"{type(exc).__name__}: {exc}"
+    detail = _http_error_detail(exc)
+    if detail and detail not in formatted:
+        return f"{formatted} ({detail})"
+    return formatted
 
 
 def _http_status(exc: BaseException) -> Optional[int]:
@@ -1679,6 +2339,8 @@ def _print_quick_setup_reconciled(ctx: _PhotonSetupContext) -> None:
     print(f"  Hermes home       : {ctx.hermes_home}")
     print(f"  env path          : {ctx.env_path}")
     print(f"  project id        : {ctx.project_id}")
+    if ctx.dashboard_project_name:
+        print(f"  dashboard         : visible as \"{ctx.dashboard_project_name}\"")
     print(
         "  local health      : "
         + (
@@ -1776,109 +2438,6 @@ def print_incomplete_setup_guidance() -> None:
     print("        hermes photon status")
     print("  Docs:")
     print(f"        {_docs_paths()}")
-
-
-def _cmd_setup(args: argparse.Namespace) -> int:
-    outcome = _run_base_setup(args, total_steps=4)
-    if outcome.returncode != 0:
-        return outcome.returncode
-    print()
-    print("✓ Photon setup complete.")
-    print("  Next: create a managed webhook tunnel and register it with Photon:")
-    print("        hermes photon webhook tunnel start")
-    print("  Or register a production/user-owned URL manually:")
-    print("        hermes photon webhook register https://YOUR-PUBLIC-URL/photon/webhook")
-    print("  Then start the gateway in foreground QA mode:")
-    print("        hermes gateway run -v")
-    print("  For always-on local use:")
-    print("        hermes gateway install --force")
-    print("        hermes gateway start")
-    _print_text_photon_number_step(outcome)
-    return 0
-
-
-def _run_base_setup(args: argparse.Namespace, *, total_steps: int) -> _SetupOutcome:
-    outcome = _SetupOutcome(project_name=_setup_project_name(args))
-
-    # 1. Login (skip if we already have a token).
-    token = photon_auth.load_photon_token()
-    existing_id, existing_secret = photon_auth.load_project_credentials()
-    if not token and not (existing_id and existing_secret):
-        print(f"[1/{total_steps}] No Photon token found — running device login...")
-        rc = _cmd_login(args)
-        if rc != 0:
-            return outcome.fail(rc)
-        token = photon_auth.load_photon_token()
-        if not token:
-            print("login completed but token was not stored", file=sys.stderr)
-            return outcome.fail()
-        print("  Next: Hermes will reuse/adopt/create the Photon project.")
-    elif existing_id and existing_secret:
-        print(f"[1/{total_steps}] Reusing existing Photon project credentials")
-        print("  Next: Hermes will bind your phone number to the Photon project.")
-    else:
-        print(f"[1/{total_steps}] Reusing existing Photon token")
-        print("  Next: Hermes will verify the Photon project.")
-
-    # 2. Resolve a project without silently duplicating dashboard resources.
-    try:
-        with photon_auth.setup_lock():
-            project_id, project_secret = _resolve_setup_project(
-                args, token, total_steps=total_steps,
-            )
-    except TimeoutError as e:
-        print(f"setup is already running: {e}", file=sys.stderr)
-        return outcome.fail()
-    if not (project_id and project_secret):
-        return outcome.fail()
-    print("  Next: Hermes will bind your phone number to a shared Photon iMessage line.")
-
-    # 3. Create a Spectrum user for the operator.
-    phone = args.phone or _prompt(
-        f"Your iMessage phone number (E.164, format {_PHONE_FORMAT}): "
-    )
-    outcome.operator_phone = phone or None
-    if not phone:
-        print(f"[3/{total_steps}] Skipped user creation (no phone given). Re-run with --phone later.")
-    else:
-        print(f"[3/{total_steps}] Creating shared Spectrum user...")
-        try:
-            user = photon_auth.create_user(
-                project_id, project_secret,
-                phone_number=phone,
-                first_name=args.first_name,
-                last_name=args.last_name,
-                email=args.email,
-            )
-        except Exception as e:
-            print(f"create-user failed: {e}", file=sys.stderr)
-            return outcome.fail()
-        outcome.assigned_phone_number = _extract_assigned_phone_number(user)
-        if outcome.assigned_phone_number:
-            print(
-                "  ✓ user created — assigned Photon iMessage number: "
-                f"{outcome.assigned_phone_number}"
-            )
-        else:
-            print(
-                "  ✓ user created — Photon did not return the assigned "
-                "iMessage number"
-            )
-        if not _ensure_operator_phone_allowed(phone):
-            return outcome.fail()
-    print("  Next: Hermes will verify/install the Node sidecar dependencies.")
-
-    # 4. Sidecar deps.
-    if args.skip_sidecar_install:
-        print(f"[4/{total_steps}] Skipping sidecar npm install (--skip-sidecar-install)")
-    else:
-        print(f"[4/{total_steps}] Installing Node sidecar deps (spectrum-ts)...")
-        rc = _install_sidecar()
-        if rc != 0:
-            return outcome.fail(rc)
-    if total_steps > 4:
-        print("  Next: Hermes will start a Cloudflare Quick Tunnel and register the webhook.")
-    return outcome
 
 
 def _setup_project_name(args: argparse.Namespace) -> str:
@@ -2295,16 +2854,6 @@ def _cmd_status(_args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_diagnose_auth(_args: argparse.Namespace) -> int:
-    _print_auth_diagnostics(photon_auth.dashboard_auth_diagnostics())
-    return 0
-
-
-def _cmd_install_sidecar(_args: argparse.Namespace) -> int:
-    rc = _install_sidecar()
-    return rc
-
-
 def _install_sidecar() -> int:
     npm = shutil.which("npm") or "npm"
     if not shutil.which(npm):
@@ -2327,11 +2876,14 @@ def _install_sidecar() -> int:
 
 def _sidecar_dependency_status() -> str:
     if not (_SIDECAR_DIR / "node_modules").exists():
-        return "✗ run `hermes photon install-sidecar`"
+        return f"✗ run `hermes photon quick-setup --phone {_PHONE_ARG_PLACEHOLDER}`"
 
     version, problems = _installed_spectrum_ts()
     if not version:
-        return "✗ spectrum-ts missing; run `hermes photon install-sidecar`"
+        return (
+            "✗ spectrum-ts missing; rerun "
+            f"`hermes photon quick-setup --phone {_PHONE_ARG_PLACEHOLDER}`"
+        )
 
     parsed = _parse_semver(version)
     if parsed is None:
@@ -2339,13 +2891,13 @@ def _sidecar_dependency_status() -> str:
     if parsed < _MIN_SPECTRUM_TS_VERSION:
         return (
             f"✗ spectrum-ts {version} is too old; "
-            "run `hermes photon install-sidecar`"
+            f"rerun `hermes photon quick-setup --phone {_PHONE_ARG_PLACEHOLDER}`"
         )
     if problems:
         detail = str(problems[0]).splitlines()[0][:120]
         return (
             f"⚠ spectrum-ts {version} installed but npm reports {detail}; "
-            "run `hermes photon install-sidecar`"
+            f"rerun `hermes photon quick-setup --phone {_PHONE_ARG_PLACEHOLDER}`"
         )
     return f"✓ installed (spectrum-ts {version})"
 
@@ -2612,36 +3164,6 @@ def _cmd_webhook(args: argparse.Namespace) -> int:
             print(f"list failed: {e}", file=sys.stderr)
             return 1
         print(json.dumps(data, indent=2))
-        return 0
-
-    if sub == "cleanup":
-        try:
-            hooks = photon_auth.list_webhooks(project_id, project_secret)
-        except Exception as e:
-            print(f"cleanup failed: {e}", file=sys.stderr)
-            return 1
-        keep_url = (
-            _get_env_value("PHOTON_WEBHOOK_PUBLIC_URL")
-            or photon_tunnel.status().get("webhook_url")
-            or ""
-        )
-        if not keep_url:
-            print(
-                "cleanup needs a current webhook URL. Run "
-                "`hermes photon webhook tunnel start` first.",
-                file=sys.stderr,
-            )
-            return 1
-        cleaned = _delete_stale_managed_webhooks(
-            project_id,
-            project_secret,
-            hooks,
-            keep_url=str(keep_url),
-        )
-        if len(cleaned) == len(hooks):
-            print("no stale managed trycloudflare.com webhooks found")
-        else:
-            print("stale managed webhooks cleaned")
         return 0
 
     if sub == "delete":
@@ -3168,7 +3690,7 @@ def _next_status_step(
     if not (project_id and project_secret):
         return f"hermes photon quick-setup --phone {_PHONE_ARG_PLACEHOLDER}"
     if sidecar_status.startswith("✗"):
-        return "hermes photon install-sidecar"
+        return f"hermes photon quick-setup --phone {_PHONE_ARG_PLACEHOLDER}"
     public_url = _get_env_value("PHOTON_WEBHOOK_PUBLIC_URL") or ""
     if not (_webhook_secret_present() and public_url):
         return "hermes photon webhook tunnel start"

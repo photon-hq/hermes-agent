@@ -526,6 +526,11 @@ def write_runtime_status(
 
     if gateway_state is not _UNSET:
         payload["gateway_state"] = gateway_state
+        if gateway_state == "starting" and platform is _UNSET:
+            # A new gateway process must not inherit stale platform entries
+            # from the previous runtime. Adapters republish their own status
+            # as they connect.
+            payload["platforms"] = {}
     if exit_reason is not _UNSET:
         payload["exit_reason"] = exit_reason
     if restart_requested is not _UNSET:

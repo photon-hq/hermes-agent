@@ -84,6 +84,7 @@ _DEFAULT_WEBHOOK_BIND = "0.0.0.0"
 
 _DEFAULT_SIDECAR_PORT = 8789
 _DEFAULT_SIDECAR_BIND = "127.0.0.1"
+_FINGERPRINT_VERSION = "sha256:16"
 
 # Photon iMessage messages from the SDK side have no documented hard
 # limit, but the underlying iMessage protocol limits practical message
@@ -104,6 +105,14 @@ _SIDECAR_DIR = Path(__file__).parent / "sidecar"
 # ---------------------------------------------------------------------------
 # Module-level helpers — also used by check_fn / standalone send
 
+
+def _secret_fingerprint(value: str) -> str:
+    if not value:
+        return ""
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+    return f"sha256:{digest}"
+
+
 def _coerce_port(value: Any, default: int) -> int:
     try:
         return int(value)
@@ -118,7 +127,7 @@ def check_requirements() -> bool:
     if not shutil.which(os.getenv("PHOTON_NODE_BIN") or "node"):
         return False
     if not (_SIDECAR_DIR / "node_modules").exists():
-        # spectrum-ts not installed yet — `hermes photon setup` will
+        # spectrum-ts not installed yet — `hermes photon quick-setup` will
         # install it.  check_fn still returns False so the gateway
         # surfaces the missing-deps state in `hermes setup` / status.
         return False
@@ -392,7 +401,7 @@ class PhotonAdapter(BasePlatformAdapter):
             self._set_fatal_error(
                 "MISSING_CREDENTIALS",
                 "PHOTON_PROJECT_ID and PHOTON_PROJECT_SECRET are required. "
-                "Run: hermes photon setup",
+                "Run: hermes photon quick-setup --phone '<phone>'",
                 retryable=False,
             )
             return False
@@ -484,6 +493,13 @@ class PhotonAdapter(BasePlatformAdapter):
                 platform="photon",
                 platform_metadata={
                     "project_id": self._project_id,
+                    "project_secret_fingerprint": _secret_fingerprint(
+                        self._project_secret
+                    ),
+                    "webhook_secret_fingerprint": _secret_fingerprint(
+                        self._webhook_secret
+                    ),
+                    "credential_fingerprint_version": _FINGERPRINT_VERSION,
                     "webhook_port": self._webhook_port,
                     "webhook_path": self._webhook_path,
                     "webhook_public_url": self._webhook_public_url,
@@ -810,7 +826,8 @@ class PhotonAdapter(BasePlatformAdapter):
         if not (_SIDECAR_DIR / "node_modules").exists():
             raise RuntimeError(
                 f"Photon sidecar deps not installed. Run: "
-                f"cd {_SIDECAR_DIR} && npm install   (or `hermes photon setup`)"
+                f"cd {_SIDECAR_DIR} && npm install   "
+                "(or rerun `hermes photon quick-setup --phone '<phone>'`)"
             )
         env = os.environ.copy()
         env["PHOTON_PROJECT_ID"] = self._project_id
