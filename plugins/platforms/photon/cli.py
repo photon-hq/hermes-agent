@@ -657,6 +657,26 @@ def _ensure_operator_phone(ctx: _PhotonSetupContext) -> None:
             observed=_photon_sender_access_status(),
             repair=f"run `hermes photon allow-phone {phone}`",
         )
+    _ensure_home_channel_default(phone)
+
+
+def _ensure_home_channel_default(phone: str) -> None:
+    """Default the cron/notification home channel to the operator's iMessage DM.
+
+    A Spectrum DM space id is derivable from the phone number (``any;-;+<phone>``)
+    and the sidecar resolves an uncached DM by address, so cron results and
+    proactive notifications reach the operator's iMessage thread with no manual
+    configuration. Only seeded when the user has not already configured one.
+    """
+    if (_get_env_value("PHOTON_HOME_CHANNEL") or "").strip():
+        print("  ✓ home channel already configured")
+        return
+    home_space = f"any;-;{phone}"
+    if not _save_env_value("PHOTON_HOME_CHANNEL", home_space):
+        return
+    if not (_get_env_value("PHOTON_HOME_CHANNEL_NAME") or "").strip():
+        _save_env_value("PHOTON_HOME_CHANNEL_NAME", "You (iMessage)")
+    print(f"  ✓ home channel set to your iMessage DM ({home_space})")
 
 
 def _lookup_project_user_by_phone(
@@ -1200,6 +1220,17 @@ def _remove_env_value(key: str) -> bool:
         return bool(remove_env_value(key))
     except Exception:
         return os.environ.pop(key, None) is not None
+
+
+def _save_env_value(key: str, value: str) -> bool:
+    try:
+        from hermes_cli.config import save_env_value  # type: ignore
+
+        save_env_value(key, value)
+        return True
+    except Exception as e:
+        print(f"could not save {key}: {e}", file=sys.stderr)
+        return False
 
 
 def _error_looks_like_existing_user(exc: BaseException) -> bool:

@@ -173,6 +173,15 @@ PHOTON_ALLOWED_USERS=...
 
 See `plugin.yaml` for the full env var list.
 
+## Home channel (cron / notifications)
+
+Gateway-initiated messages (cron results, reminders, proactive notifications)
+go to the **home channel** `PHOTON_HOME_CHANNEL`. `quick-setup` defaults it to
+your own iMessage DM — `any;-;+<your phone>` — so those land in your thread
+with no manual configuration. Override it to target a group space id (`any;+;
+<chat-guid>`, available once that group exists), or clear it to disable cron
+delivery.
+
 ## Current Limitations
 
 - Attachments are surfaced as metadata only (the SDK exposes attachment bytes,

@@ -105,6 +105,32 @@ def test_runtime_reset_keys_drop_webhook_entries() -> None:
     assert "PHOTON_SIDECAR_PORT" not in photon_cli._PHOTON_GATEWAY_ENV_KEYS
 
 
+def test_home_channel_defaults_to_operator_dm(monkeypatch: Any) -> None:
+    saved: dict[str, str] = {}
+    monkeypatch.setattr(photon_cli, "_get_env_value", lambda k: saved.get(k))
+    monkeypatch.setattr(
+        photon_cli, "_save_env_value", lambda k, v: (saved.__setitem__(k, v) or True)
+    )
+
+    photon_cli._ensure_home_channel_default("+14155551234")
+
+    assert saved["PHOTON_HOME_CHANNEL"] == "any;-;+14155551234"
+    assert saved["PHOTON_HOME_CHANNEL_NAME"] == "You (iMessage)"
+
+
+def test_home_channel_not_overwritten_when_already_set(monkeypatch: Any) -> None:
+    saved: dict[str, str] = {"PHOTON_HOME_CHANNEL": "any;+;existing-group-guid"}
+    monkeypatch.setattr(photon_cli, "_get_env_value", lambda k: saved.get(k))
+    monkeypatch.setattr(
+        photon_cli, "_save_env_value", lambda k, v: (saved.__setitem__(k, v) or True)
+    )
+
+    photon_cli._ensure_home_channel_default("+14155551234")
+
+    assert saved["PHOTON_HOME_CHANNEL"] == "any;+;existing-group-guid"
+    assert "PHOTON_HOME_CHANNEL_NAME" not in saved
+
+
 def test_next_status_step_prompts_login_without_credentials(
     monkeypatch: Any,
 ) -> None:
