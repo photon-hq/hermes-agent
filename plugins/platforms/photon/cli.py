@@ -1507,31 +1507,56 @@ def _print_quick_setup_reconciled(ctx: _PhotonSetupContext) -> None:
 # Interactive setup entry point + guidance
 
 def interactive_setup() -> None:
-    """Entry point used by `hermes setup gateway` when Photon is selected."""
-    from hermes_cli.cli_output import print_info, prompt_yes_no
+    """Entry point used by `hermes setup gateway` when Photon is selected.
 
-    project_id, project_secret = photon_auth.load_project_credentials()
-    if (
-        not photon_auth.load_photon_token()
-        and not (project_id and project_secret)
-    ):
-        print_incomplete_setup_guidance()
-        return
+    Runs in the setup wizard's line-based TTY (after the platform checklist),
+    so it prompts for the phone number up front with the shared cli_output
+    helpers and then hands off to the full quick-setup reconciler — which
+    runs device login itself when no token is stored yet.
+    """
+    from hermes_cli.cli_output import (
+        print_header,
+        print_info,
+        print_warning,
+        prompt,
+        prompt_yes_no,
+    )
+
+    print_header("Photon iMessage")
 
     if _interactive_setup_already_configured():
         print_info("Photon iMessage is already configured.")
         if not prompt_yes_no("Reconfigure Photon iMessage?", False):
             return
 
+    print_info(
+        "Photon connects Hermes to iMessage over a managed gRPC stream — "
+        "no tunnel or open ports."
+    )
+    print_info(
+        'Setup signs you in to Photon, creates or reuses the "Hermes Agent" '
+        "project, registers your phone, and starts the gateway."
+    )
+
+    phone = prompt("Your iMessage phone number (E.164, e.g. +14155551234)")
+    while phone and not photon_auth.E164_RE.match(phone):
+        print_warning("Use E.164 format: + country code and number, no spaces.")
+        phone = prompt("Your iMessage phone number (E.164, e.g. +14155551234)")
+    if not phone:
+        print_info("A phone number is required to finish Photon setup.")
+        print_incomplete_setup_guidance()
+        return
+
     args = argparse.Namespace(
         project_name=None,
-        phone=None,
+        phone=phone,
         first_name=None,
         last_name=None,
         email=None,
         no_browser=False,
         new_project=False,
         skip_sidecar_install=False,
+        verbose=False,
     )
     rc = _cmd_quick_setup(args)
     if rc != 0:

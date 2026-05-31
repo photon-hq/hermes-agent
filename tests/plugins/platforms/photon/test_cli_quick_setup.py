@@ -115,6 +115,49 @@ def test_next_status_step_prompts_login_without_credentials(
     assert photon_cli._next_status_step("✓ installed") == "hermes photon login"
 
 
+def test_interactive_setup_prompts_phone_and_passes_it_through(
+    monkeypatch: Any,
+) -> None:
+    import hermes_cli.cli_output as co
+
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(photon_cli, "_interactive_setup_already_configured", lambda: False)
+    monkeypatch.setattr(
+        photon_cli,
+        "_cmd_quick_setup",
+        lambda args: captured.update(phone=args.phone, new_project=args.new_project) or 0,
+    )
+    monkeypatch.setattr(co, "print_header", lambda *_a, **_k: None)
+    monkeypatch.setattr(co, "print_info", lambda *_a, **_k: None)
+    monkeypatch.setattr(co, "print_warning", lambda *_a, **_k: None)
+    monkeypatch.setattr(co, "prompt_yes_no", lambda *_a, **_k: True)
+    monkeypatch.setattr(co, "prompt", lambda *_a, **_k: "+14155551234")
+
+    photon_cli.interactive_setup()
+
+    assert captured["phone"] == "+14155551234"
+    assert captured["new_project"] is False
+
+
+def test_interactive_setup_reprompts_on_bad_phone(monkeypatch: Any) -> None:
+    import hermes_cli.cli_output as co
+
+    answers = iter(["not-a-phone", "+14155551234"])
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(photon_cli, "_interactive_setup_already_configured", lambda: False)
+    monkeypatch.setattr(
+        photon_cli, "_cmd_quick_setup", lambda args: captured.update(phone=args.phone) or 0
+    )
+    monkeypatch.setattr(co, "print_header", lambda *_a, **_k: None)
+    monkeypatch.setattr(co, "print_info", lambda *_a, **_k: None)
+    monkeypatch.setattr(co, "print_warning", lambda *_a, **_k: None)
+    monkeypatch.setattr(co, "prompt", lambda *_a, **_k: next(answers))
+
+    photon_cli.interactive_setup()
+
+    assert captured["phone"] == "+14155551234"
+
+
 def test_next_status_step_connected_gateway(monkeypatch: Any) -> None:
     monkeypatch.setattr(photon_cli.photon_auth, "load_photon_token", lambda: "tok")
     monkeypatch.setattr(
