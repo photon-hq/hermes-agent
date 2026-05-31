@@ -717,7 +717,7 @@ def register(ctx) -> None:
 
     ctx.register_platform(
         name="photon",
-        label="Photon iMessage",
+        label="iMessage (via Photon)",
         adapter_factory=lambda cfg: PhotonAdapter(cfg),
         check_fn=check_requirements,
         validate_config=validate_config,
