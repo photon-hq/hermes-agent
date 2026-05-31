@@ -193,7 +193,7 @@ Photon iMessage status
   gateway service     : launchd installed; running; home=/Users/you/.hermes
   gateway runtime     : pid 12345; photon=connected
   node binary         : /usr/bin/node
-  sidecar deps        : ✓ installed (spectrum-ts 1.7.2)
+  sidecar deps        : ✓ installed (spectrum-ts 1.17.0)
   authorized phones   : 1 configured
   next step           : gateway is running; send an iMessage to the Photon number
   docs                : plugins/platforms/photon/README.md; website/docs/user-guide/messaging/photon.md

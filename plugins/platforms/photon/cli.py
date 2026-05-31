@@ -38,7 +38,7 @@ from hermes_constants import get_hermes_home
 from . import auth as photon_auth
 
 _SIDECAR_DIR = Path(__file__).parent / "sidecar"
-_MIN_SPECTRUM_TS_VERSION = (1, 7, 2)
+_MIN_SPECTRUM_TS_VERSION = (1, 17, 0)
 _PHONE_FORMAT = "+<country-code><number>"
 _PHONE_ARG_PLACEHOLDER = f"'{_PHONE_FORMAT}'"
 _PHOTON_RUNTIME_RESET_ENV_KEYS = (

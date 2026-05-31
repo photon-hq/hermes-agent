@@ -105,6 +105,36 @@ def test_runtime_reset_keys_drop_webhook_entries() -> None:
     assert "PHOTON_SIDECAR_PORT" not in photon_cli._PHOTON_GATEWAY_ENV_KEYS
 
 
+def test_sidecar_dependency_status_rejects_old_spectrum_ts(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    (tmp_path / "node_modules").mkdir()
+    monkeypatch.setattr(photon_cli, "_SIDECAR_DIR", tmp_path)
+    monkeypatch.setattr(
+        photon_cli, "_installed_spectrum_ts", lambda: ("1.7.2", [])
+    )
+
+    status = photon_cli._sidecar_dependency_status()
+
+    assert status.startswith("✗ spectrum-ts 1.7.2 is too old")
+
+
+def test_sidecar_dependency_status_accepts_current_spectrum_ts(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    (tmp_path / "node_modules").mkdir()
+    monkeypatch.setattr(photon_cli, "_SIDECAR_DIR", tmp_path)
+    monkeypatch.setattr(
+        photon_cli, "_installed_spectrum_ts", lambda: ("1.17.0", [])
+    )
+
+    status = photon_cli._sidecar_dependency_status()
+
+    assert status == "✓ installed (spectrum-ts 1.17.0)"
+
+
 def test_home_channel_defaults_to_operator_dm(monkeypatch: Any) -> None:
     saved: dict[str, str] = {}
     monkeypatch.setattr(photon_cli, "_get_env_value", lambda k: saved.get(k))
