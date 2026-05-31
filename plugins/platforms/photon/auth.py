@@ -3,8 +3,7 @@ Photon Dashboard + Spectrum API client and device-code login flow.
 
 This module is pure Python — it intentionally does not depend on
 ``spectrum-ts``.  All management-plane operations (login, create
-project, create user, register webhook) talk to Photon's HTTP API
-directly:
+project, create user) talk to Photon's HTTP API directly:
 
     Dashboard API   https://app.photon.codes/api/...
                     project-valid token candidate from the device flow
@@ -12,10 +11,11 @@ directly:
     Spectrum API    https://spectrum.photon.codes/projects/{id}/...
                     HTTP Basic with (projectId, projectSecret)
 
-The webhook receiver + Node sidecar in ``adapter.py`` consume the
-Spectrum project credentials from Hermes' canonical ``~/.hermes/.env``.
-Photon's dashboard/device token is also persisted there as
-``PHOTON_DASHBOARD_TOKEN`` so Photon secrets have one storage surface.
+The Node sidecar in ``adapter.py`` consumes the Spectrum project
+credentials from Hermes' canonical ``~/.hermes/.env`` to open Photon's
+managed gRPC stream. Photon's dashboard/device token is also persisted
+there as ``PHOTON_DASHBOARD_TOKEN`` so Photon secrets have one storage
+surface.
 
 Reference docs (read at integration time):
   https://photon.codes/docs/api-reference/introduction
@@ -23,7 +23,7 @@ Reference docs (read at integration time):
   https://photon.codes/docs/api-reference/device-login/exchange-device-code-for-token
   https://photon.codes/docs/api-reference/projects/create-project
   https://photon.codes/docs/api-reference/users/create-user
-  https://photon.codes/docs/webhooks/overview
+  https://photon.codes/docs/spectrum-ts/introduction
 """
 from __future__ import annotations
 
@@ -1231,49 +1231,10 @@ def _user_items(data: Any) -> list[Dict[str, Any]]:
     return [item for item in items if isinstance(item, dict)]
 
 
-# ---------------------------------------------------------------------------
-# Spectrum API: webhook registration
-#
-# Endpoints from https://photon.codes/docs/webhooks/overview:
-#   POST   /projects/{id}/webhooks/          register, returns signing secret ONCE
-#   GET    /projects/{id}/webhooks/          list
-#   DELETE /projects/{id}/webhooks/{wid}     remove
-
-def register_webhook(
-    project_id: str, project_secret: str, *, webhook_url: str,
-) -> Dict[str, Any]:
-    """Register a webhook URL with Photon and return the API response.
-
-    Photon returns the per-URL signing secret exactly once in this
-    response, so callers who need to persist it should hand the
-    response to :func:`persist_webhook_signing_secret` immediately —
-    that helper writes the value into ``~/.hermes/.env`` (mode 0o600,
-    existing entries preserved) without the secret value ever needing
-    to leave this module.
-    """
-    if httpx is None:
-        raise RuntimeError("httpx is required for Photon webhook registration")
-    url = f"{_spectrum_host()}/projects/{project_id}/webhooks/"
-    resp = httpx.post(
-        url,
-        json={"webhookUrl": webhook_url},
-        auth=(project_id, project_secret),
-        timeout=30.0,
-    )
-    resp.raise_for_status()
-    data = resp.json() or {}
-    if not data.get("succeed"):
-        raise RuntimeError(
-            f"Photon register-webhook failed: {data.get('message') or data}"
-        )
-    return data.get("data") or {}
-
-
 def print_credential_summary(emit: Any = print) -> None:
     """Pretty-print the credential status table via the *emit* callback.
 
-    Same isolation rationale as :func:`persist_webhook_signing_secret`:
-    all secret-bearing reads happen inside this function; the *emit*
+    All secret-bearing reads happen inside this function; the *emit*
     callback only ever receives display literals like ``"✓ stored"``
     or a project UUID. No tainted variable ever escapes into the
     caller's scope. Default ``emit=print`` so the function is usable
@@ -1295,10 +1256,6 @@ def print_credential_summary(emit: Any = print) -> None:
     pid, sec = load_project_credentials()
     labels["project_id"] = pid if pid else "✗ missing"
     labels["project_key"] = "✓ stored" if sec else "✗ missing"
-    if _get_hermes_env_value("PHOTON_WEBHOOK_SECRET"):
-        labels["webhook_key"] = "✓ set"
-    else:
-        labels["webhook_key"] = "⚠ unset — verification disabled"
 
     rows = [
         "Photon iMessage status",
@@ -1306,7 +1263,6 @@ def print_credential_summary(emit: Any = print) -> None:
         "  device token        : " + labels["device_token"],
         "  project id          : " + labels["project_id"],
         "  project key         : " + labels["project_key"],
-        "  webhook key         : " + labels["webhook_key"],
     ]
     emit("\n".join(rows))
 
@@ -1330,95 +1286,8 @@ def credential_summary() -> Dict[str, str]:
         _pid, sec = load_project_credentials()
         return "✓ stored" if sec else "✗ missing"
 
-    def _present_webhook_secret() -> str:
-        return "✓ set" if _get_hermes_env_value("PHOTON_WEBHOOK_SECRET") else "⚠ unset — verification disabled"
-
     return {
         "device_token": _present_token(),
         "project_id": _present_project_id(),
         "project_key": _present_project_secret(),
-        "webhook_key": _present_webhook_secret(),
     }
-
-
-def persist_webhook_signing_secret(
-    webhook_data: Dict[str, Any],
-    *,
-    on_summary: Optional[Any] = None,
-) -> bool:
-    """Persist a webhook signing secret via Hermes' canonical .env writer.
-
-    Delegates to :func:`hermes_cli.config.save_env_value` — the same
-    helper that backs every other API-key persistence path in Hermes
-    Agent (OpenAI key, Anthropic key, Telegram token, ...). The secret
-    value is read directly from ``webhook_data['signingSecret']`` (or
-    ``['secret']`` fallback) and handed to that helper without ever
-    being bound to a local in any module that prints or logs.
-
-    Returns ``True`` on success, ``False`` if the response had no
-    secret OR the write failed. The optional ``on_summary`` callable
-    receives a plain string with no credential material, suitable for
-    printing — e.g. ``"Wrote to /home/u/.hermes/.env"`` or
-    ``"register response: {redacted dict json}"``.  We do the
-    formatting here so callers stay clear of the taint flow CodeQL
-    tracks through functions that touch secrets.
-    """
-    if not isinstance(webhook_data, dict):
-        return False
-    has_secret = bool(webhook_data.get("signingSecret") or webhook_data.get("secret"))
-    redacted = {
-        k: ("<redacted>" if k in ("signingSecret", "secret") else v)
-        for k, v in webhook_data.items()
-    }
-    if on_summary is not None:
-        try:
-            on_summary("webhook registration response (redacted):")
-            on_summary(json.dumps(redacted, indent=2))
-        except Exception:
-            pass
-    if not has_secret:
-        return False
-    try:
-        from hermes_cli.config import save_env_value  # type: ignore
-    except ImportError:
-        return False
-    try:
-        save_env_value(
-            "PHOTON_WEBHOOK_SECRET",
-            webhook_data.get("signingSecret") or webhook_data.get("secret") or "",
-        )
-    except Exception:
-        return False
-    if on_summary is not None:
-        try:
-            from hermes_constants import get_hermes_home  # type: ignore
-            env_path = Path(get_hermes_home()) / ".env"
-        except Exception:
-            env_path = Path(os.path.expanduser("~/.hermes")) / ".env"
-        try:
-            on_summary(f"signing key saved to {env_path}")
-            on_summary("(Photon only returns this once — keep the file safe)")
-        except Exception:
-            pass
-    return True
-
-
-def list_webhooks(project_id: str, project_secret: str) -> list:
-    if httpx is None:
-        raise RuntimeError("httpx is required for Photon webhook listing")
-    url = f"{_spectrum_host()}/projects/{project_id}/webhooks/"
-    resp = httpx.get(url, auth=(project_id, project_secret), timeout=30.0)
-    resp.raise_for_status()
-    data = resp.json() or {}
-    return data.get("data") or []
-
-
-def delete_webhook(
-    project_id: str, project_secret: str, *, webhook_id: str,
-) -> None:
-    if httpx is None:
-        raise RuntimeError("httpx is required for Photon webhook deletion")
-    url = f"{_spectrum_host()}/projects/{project_id}/webhooks/{webhook_id}"
-    resp = httpx.delete(url, auth=(project_id, project_secret), timeout=30.0)
-    if resp.status_code not in (200, 204, 404):
-        resp.raise_for_status()

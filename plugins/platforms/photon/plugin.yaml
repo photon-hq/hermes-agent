@@ -1,19 +1,19 @@
 name: photon-platform
 label: Photon iMessage
 kind: platform
-version: 0.1.0
+version: 0.2.0
 description: >
   Photon Spectrum gateway adapter for Hermes Agent.
   Connects to iMessage (and other Spectrum interfaces) through Photon's
-  managed Spectrum platform. Inbound messages arrive as signed webhooks
-  on a local aiohttp server; outbound messages are sent via a small
-  supervised Node sidecar that runs the `spectrum-ts` SDK (Photon does
-  not currently expose a public HTTP send endpoint).
+  managed Spectrum platform. A small supervised Node sidecar runs the
+  `spectrum-ts` SDK and holds Photon's managed gRPC connection: inbound
+  messages stream over that connection (no webhook, no tunnel) and outbound
+  messages are sent through the same sidecar.
 
   The plugin ships with a `hermes photon` CLI for quick login + project
-  + user + sidecar + managed webhook tunnel setup, persists Photon secrets
-  to ``~/.hermes/.env``, and exposes Photon's free shared-line model so
-  users can get started without a paid plan.
+  + phone-number registration + sidecar setup, persists Photon secrets to
+  ``~/.hermes/.env``, and exposes Photon's free shared-line model so users
+  can get started without a paid plan.
 author: NousResearch
 requires_env:
   - name: PHOTON_PROJECT_ID
@@ -32,38 +32,6 @@ optional_env:
     prompt: "Photon dashboard token"
     url: "https://app.photon.codes/"
     password: true
-  - name: PHOTON_WEBHOOK_SECRET
-    description: "Per-URL HMAC-SHA256 signing secret returned at webhook registration"
-    prompt: "Photon webhook signing secret"
-    password: true
-  - name: PHOTON_WEBHOOK_PUBLIC_URL
-    description: "Public Photon webhook URL registered by quick setup or webhook register"
-    prompt: "Photon webhook public URL"
-    password: false
-  - name: PHOTON_WEBHOOK_TUNNEL_AUTOSTART
-    description: "Start/register the managed Cloudflare Quick Tunnel when the gateway connects (default true)"
-    prompt: "Auto-start managed webhook tunnel?"
-    password: false
-  - name: PHOTON_WEBHOOK_TUNNEL_STOP_ON_DISCONNECT
-    description: "Stop a gateway-started managed tunnel when the gateway stops (default true)"
-    prompt: "Stop managed tunnel with gateway?"
-    password: false
-  - name: PHOTON_WEBHOOK_PORT
-    description: "Local port the webhook receiver listens on (default 8788)"
-    prompt: "Webhook receiver port"
-    password: false
-  - name: PHOTON_WEBHOOK_PATH
-    description: "Path the webhook receiver listens on (default /photon/webhook)"
-    prompt: "Webhook receiver path"
-    password: false
-  - name: PHOTON_WEBHOOK_BIND
-    description: "Bind address for the webhook receiver (default 0.0.0.0)"
-    prompt: "Webhook bind address"
-    password: false
-  - name: PHOTON_SIDECAR_PORT
-    description: "Loopback port for the Node sidecar control channel (default 8789)"
-    prompt: "Sidecar control port"
-    password: false
   - name: PHOTON_SIDECAR_AUTOSTART
     description: "Spawn the Node sidecar on connect (true/false, default true)"
     prompt: "Auto-start the sidecar?"

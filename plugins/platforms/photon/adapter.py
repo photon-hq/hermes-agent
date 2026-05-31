@@ -1,56 +1,41 @@
 """
 Photon Spectrum (iMessage) platform adapter for Hermes Agent.
 
-Inbound:
-    Photon delivers signed JSON ``POST``s to a URL we register.  The
-    adapter spins up an aiohttp server on ``PHOTON_WEBHOOK_PORT``,
-    verifies ``X-Spectrum-Signature`` (HMAC-SHA256 of
-    ``v0:{timestamp}:{body}`` keyed by the per-URL signing secret),
-    rejects deliveries with a timestamp drift > 5 minutes, dedupes on
-    ``message.id``, and dispatches a normalized ``MessageEvent`` to the
-    gateway runner via ``BasePlatformAdapter.handle_message``.
+Transport:
+    A single supervised Node sidecar (see ``sidecar/index.mjs``) runs the
+    ``spectrum-ts`` SDK and holds Photon's managed gRPC connection. There is
+    no webhook and no public tunnel — the channel behaves like Telegram or
+    Discord: one persistent connection for the lifetime of the gateway.
 
-Outbound:
-    Photon does not currently expose a public HTTP send-message
-    endpoint, so the adapter spawns a small Node sidecar (see
-    ``sidecar/index.mjs``) that runs the ``spectrum-ts`` SDK.  Each
-    ``send`` / ``send_typing`` call from Hermes is a loopback POST to
-    the sidecar with a shared bearer token.
+    Inbound:
+        The sidecar consumes the SDK's ``app.messages`` gRPC stream and emits
+        one newline-delimited JSON event per message on **stdout**. A reader
+        task here parses each line, normalizes it to a ``MessageEvent`` and
+        dispatches it via ``BasePlatformAdapter.handle_message``.
 
-When Photon ships an HTTP send endpoint we can collapse the sidecar
-into ``_send_via_http`` and drop the Node dependency entirely.
+    Outbound:
+        ``send`` / ``send_typing`` write a newline-delimited JSON command to
+        the sidecar's **stdin** and await the correlated ack.
+
+    The sidecar writes only NDJSON to stdout; all of its diagnostics go to
+    stderr, which we pump into the Hermes logger. Closing the sidecar's stdin
+    (on disconnect, or when the gateway exits) triggers a graceful shutdown.
 """
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import hmac
 import json
 import logging
 import os
-import secrets
 import shutil
 import signal
 import subprocess
 import sys
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
-
-try:
-    import httpx
-    HTTPX_AVAILABLE = True
-except ImportError:  # pragma: no cover - httpx is already a Hermes dep
-    HTTPX_AVAILABLE = False
-    httpx = None  # type: ignore[assignment]
-
-try:
-    from aiohttp import web
-    AIOHTTP_AVAILABLE = True
-except ImportError:
-    AIOHTTP_AVAILABLE = False
-    web = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
@@ -62,85 +47,57 @@ from gateway.platforms.base import (
 from hermes_constants import get_hermes_home
 
 from .auth import (
-    DEFAULT_SPECTRUM_HOST,
     _get_hermes_env_value,
     load_allowed_phone_numbers,
     load_project_credentials,
-    list_webhooks,
-    register_webhook,
-    delete_webhook,
-    persist_webhook_signing_secret,
-    _spectrum_host,
 )
-from . import tunnel as photon_tunnel
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Constants
 
-_DEFAULT_WEBHOOK_PORT = 8788
-_DEFAULT_WEBHOOK_PATH = "/photon/webhook"
-_DEFAULT_WEBHOOK_BIND = "0.0.0.0"
-
-_DEFAULT_SIDECAR_PORT = 8789
-_DEFAULT_SIDECAR_BIND = "127.0.0.1"
-# Photon iMessage messages from the SDK side have no documented hard
-# limit, but the underlying iMessage protocol limits practical message
-# size to ~16 KB.  Keep a conservative cap that matches BlueBubbles.
+# Photon iMessage messages from the SDK side have no documented hard limit,
+# but the underlying iMessage protocol limits practical message size to
+# ~16 KB.  Keep a conservative cap that matches BlueBubbles.
 _MAX_MESSAGE_LENGTH = 8000
 
-# Spec says reject deliveries older than ~5 minutes for replay protection.
-_TIMESTAMP_DRIFT_SECONDS = 300
-
-# Dedup parameters — keep at least 1k IDs for ~48h per Photon's
-# at-least-once guidance.
+# Dedup parameters — the gRPC stream can redeliver the same message.id across
+# reconnects, so keep a small in-memory window as cheap insurance.
 _DEDUP_MAX_SIZE = 4000
 _DEDUP_WINDOW_SECONDS = 48 * 3600
 
 _SIDECAR_DIR = Path(__file__).parent / "sidecar"
+
+# spectrum-ts establishes a gRPC connection on startup; give it room.
+_READY_TIMEOUT_SECONDS = 20.0
+_SEND_TIMEOUT_SECONDS = 30.0
+
+# Protocol version the sidecar advertises in its ``ready`` event.
+_SIDECAR_PROTOCOL = 1
 
 
 # ---------------------------------------------------------------------------
 # Module-level helpers — also used by check_fn / standalone send
 
 
-def _coerce_port(value: Any, default: int) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
-
 def check_requirements() -> bool:
-    """Return True when both Python deps and the Node sidecar are available."""
-    if not HTTPX_AVAILABLE or not AIOHTTP_AVAILABLE:
-        return False
+    """Return True when the Node sidecar can run (node + installed deps)."""
     if not shutil.which(os.getenv("PHOTON_NODE_BIN") or "node"):
         return False
     if not (_SIDECAR_DIR / "node_modules").exists():
         # spectrum-ts not installed yet — `hermes photon quick-setup` will
-        # install it.  check_fn still returns False so the gateway
-        # surfaces the missing-deps state in `hermes setup` / status.
+        # install it.  check_fn still returns False so the gateway surfaces
+        # the missing-deps state in `hermes setup` / status.
         return False
     return True
 
 
-def _sidecar_process_env(
-    *,
-    project_id: str,
-    project_secret: str,
-    sidecar_port: int,
-    sidecar_bind: str,
-    sidecar_token: str,
-) -> Dict[str, str]:
+def _sidecar_process_env(*, project_id: str, project_secret: str) -> Dict[str, str]:
     env = os.environ.copy()
     env["HERMES_HOME"] = str(get_hermes_home())
     env["PHOTON_PROJECT_ID"] = project_id
     env["PHOTON_PROJECT_SECRET"] = project_secret
-    env["PHOTON_SIDECAR_PORT"] = str(sidecar_port)
-    env["PHOTON_SIDECAR_BIND"] = sidecar_bind
-    env["PHOTON_SIDECAR_TOKEN"] = sidecar_token
     return env
 
 
@@ -161,26 +118,12 @@ def validate_config(cfg: PlatformConfig) -> bool:
 def is_connected(cfg: PlatformConfig) -> bool:
     """Return True only when Photon can be enabled by the gateway.
 
-    Project credentials alone are not enough: quick setup can fail after
-    storing them, and treating that partial state as configured makes the
-    setup wizard offer to start a gateway that cannot receive Photon traffic.
+    Parity with Telegram/Discord: valid project credentials + an installed
+    sidecar + at least one authorized sender (or allow-all).
     """
-    if photon_tunnel.active_home_mismatch():
-        return False
     if not validate_config(cfg) or not check_requirements():
         return False
     extra = cfg.extra or {}
-    public_url = (
-        extra.get("webhook_public_url")
-        or extra.get("public_url")
-        or _get_hermes_env_value("PHOTON_WEBHOOK_PUBLIC_URL")
-    )
-    webhook_secret = (
-        extra.get("webhook_secret")
-        or _get_hermes_env_value("PHOTON_WEBHOOK_SECRET")
-    )
-    if not (public_url and webhook_secret):
-        return False
     if _truthy_photon_value(extra.get("allow_all")):
         return True
     if _truthy_photon_value(_get_hermes_env_value("PHOTON_ALLOW_ALL_USERS")):
@@ -207,112 +150,25 @@ def _env_enablement() -> Optional[dict]:
     return {
         "project_id": project_id,
         "project_secret": project_secret,
-        "webhook_port": _coerce_port(os.getenv("PHOTON_WEBHOOK_PORT"), _DEFAULT_WEBHOOK_PORT),
-        "webhook_path": os.getenv("PHOTON_WEBHOOK_PATH") or _DEFAULT_WEBHOOK_PATH,
     }
 
 
-# ---------------------------------------------------------------------------
-# Signature verification
-
-def verify_signature(
-    *,
-    body: bytes,
-    timestamp_header: str,
-    signature_header: str,
-    signing_secret: str,
-    now: Optional[float] = None,
-    drift: int = _TIMESTAMP_DRIFT_SECONDS,
-) -> bool:
-    """Constant-time verify a Photon webhook signature.
-
-    Returns True iff the timestamp is within ``drift`` of *now* AND
-    ``signature_header == "v0=" + hmac_sha256(secret, "v0:{ts}:{body}")``.
-
-    Exposed at module scope so tests can exercise it without an adapter
-    instance.
-    """
-    if not timestamp_header or not signature_header or not signing_secret:
-        return False
-    try:
-        ts = int(timestamp_header)
-    except ValueError:
-        return False
-    if abs((now or time.time()) - ts) > drift:
-        return False
-    if not signature_header.startswith("v0="):
-        return False
-    expected = hmac.new(
-        signing_secret.encode("utf-8"),
-        f"v0:{ts}:".encode("utf-8") + body,
-        hashlib.sha256,
-    ).hexdigest()
-    return hmac.compare_digest(expected, signature_header[3:])
-
-
-def _webhook_id(webhook: Any) -> str:
-    if not isinstance(webhook, dict):
-        return ""
-    for key in ("id", "webhookId", "webhook_id", "uuid"):
-        value = webhook.get(key)
-        if value:
-            return str(value)
-    return ""
-
-
-def _webhook_url(webhook: Any) -> str:
-    if not isinstance(webhook, dict):
-        return ""
-    return str(webhook.get("webhookUrl") or webhook.get("url") or "")
-
-
-def _save_env_value(key: str, value: str) -> None:
-    try:
-        from hermes_cli.config import save_env_value  # type: ignore
-
-        save_env_value(key, value)
-    except Exception as e:
-        logger.warning("[photon] failed to save %s: %s", key, e)
-
-
-def _port_owner_hint(port: int) -> str:
-    if os.name != "posix":
-        return ""
-    try:
-        proc = subprocess.run(  # noqa: S603
-            ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN"],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=2,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return ""
-    lines = [line for line in (proc.stdout or "").splitlines() if line.strip()]
-    if len(lines) < 2:
-        return ""
-    parts = lines[1].split()
-    if len(parts) < 2:
-        return ""
-    command = parts[0]
-    pid = parts[1]
-    return f"owned by PID {pid} ({command})"
-
-
-def _active_hermes_home_label() -> str:
-    try:
-        from hermes_constants import get_hermes_home
-
-        return str(get_hermes_home())
-    except Exception:
-        return os.getenv("HERMES_HOME") or str(Path.home() / ".hermes")
+def _attachment_message_type(mime: str) -> MessageType:
+    mime = (mime or "").lower()
+    if mime.startswith("image/"):
+        return MessageType.PHOTO
+    if mime.startswith("video/"):
+        return MessageType.VIDEO
+    if mime.startswith("audio/"):
+        return MessageType.AUDIO
+    return MessageType.DOCUMENT
 
 
 # ---------------------------------------------------------------------------
 # Adapter
 
 class PhotonAdapter(BasePlatformAdapter):
-    """Inbound: signed webhook on aiohttp. Outbound: Node sidecar via loopback HTTP."""
+    """Persistent spectrum-ts gRPC channel via a supervised Node sidecar."""
 
     MAX_MESSAGE_LENGTH = _MAX_MESSAGE_LENGTH
 
@@ -336,77 +192,27 @@ class PhotonAdapter(BasePlatformAdapter):
             or ""
         )
 
-        # Webhook receiver
-        self._webhook_port = _coerce_port(
-            extra.get("webhook_port") or os.getenv("PHOTON_WEBHOOK_PORT"),
-            _DEFAULT_WEBHOOK_PORT,
-        )
-        self._webhook_path = (
-            extra.get("webhook_path")
-            or os.getenv("PHOTON_WEBHOOK_PATH")
-            or _DEFAULT_WEBHOOK_PATH
-        )
-        self._webhook_bind = (
-            extra.get("webhook_bind")
-            or os.getenv("PHOTON_WEBHOOK_BIND")
-            or _DEFAULT_WEBHOOK_BIND
-        )
-        self._webhook_secret: str = (
-            os.getenv("PHOTON_WEBHOOK_SECRET")
-            or extra.get("webhook_secret")
-            or ""
-        )
-        self._webhook_public_url: str = (
-            os.getenv("PHOTON_WEBHOOK_PUBLIC_URL")
-            or extra.get("webhook_public_url")
-            or ""
-        )
-        self._autostart_tunnel = str(
-            os.getenv("PHOTON_WEBHOOK_TUNNEL_AUTOSTART", "true")
-        ).lower() not in ("0", "false", "no")
-        self._stop_tunnel_on_disconnect = str(
-            os.getenv("PHOTON_WEBHOOK_TUNNEL_STOP_ON_DISCONNECT", "true")
-        ).lower() not in ("0", "false", "no")
-
-        # Sidecar
-        self._sidecar_port = _coerce_port(
-            extra.get("sidecar_port") or os.getenv("PHOTON_SIDECAR_PORT"),
-            _DEFAULT_SIDECAR_PORT,
-        )
-        self._sidecar_bind = _DEFAULT_SIDECAR_BIND
-        self._sidecar_token = (
-            os.getenv("PHOTON_SIDECAR_TOKEN") or secrets.token_hex(16)
-        )
         self._autostart_sidecar = str(
             os.getenv("PHOTON_SIDECAR_AUTOSTART", "true")
         ).lower() not in ("0", "false", "no")
         self._node_bin = os.getenv("PHOTON_NODE_BIN") or shutil.which("node") or "node"
 
         # Runtime state
-        self._runner: Optional["web.AppRunner"] = None
-        self._managed_tunnel_started = False
         self._sidecar_proc: Optional[subprocess.Popen] = None
-        self._sidecar_supervisor_task: Optional[asyncio.Task] = None
-        self._http_client: Optional["httpx.AsyncClient"] = None
-        # Lightweight in-memory dedup. Photon's at-least-once guarantee
-        # means we WILL see the same message.id more than once.
+        self._sidecar_stdin: Optional[Any] = None
+        self._reader_task: Optional[asyncio.Task] = None
+        self._stderr_task: Optional[asyncio.Task] = None
+        self._ready_event = asyncio.Event()
+        self._ready_error: Optional[tuple[str, str]] = None
+        self._pending: Dict[str, asyncio.Future] = {}
+        self._inflight: set[asyncio.Task] = set()
+        self._closing = False
+        # Lightweight in-memory dedup keyed on message.id.
         self._seen_messages: Dict[str, float] = {}
 
     # -- Connection lifecycle ---------------------------------------------
 
     async def connect(self) -> bool:
-        if not AIOHTTP_AVAILABLE:
-            self._set_fatal_error(
-                "MISSING_DEP",
-                "aiohttp not installed. Run: pip install aiohttp",
-                retryable=False,
-            )
-            return False
-        if not HTTPX_AVAILABLE:
-            self._set_fatal_error(
-                "MISSING_DEP", "httpx not installed", retryable=False
-            )
-            return False
         if not self._project_id or not self._project_secret:
             self._set_fatal_error(
                 "MISSING_CREDENTIALS",
@@ -415,366 +221,287 @@ class PhotonAdapter(BasePlatformAdapter):
                 retryable=False,
             )
             return False
-        mismatch = photon_tunnel.active_home_mismatch()
-        if mismatch:
-            owner_home, current_home = mismatch
-            message = (
-                "Photon is claimed by another Hermes home "
-                f"({owner_home}); this gateway is running from {current_home}. "
-                "Skipping Photon startup to avoid taking over iMessage."
-            )
-            logger.warning("[photon] %s", message)
+        if not check_requirements():
             self._set_fatal_error(
-                "PHOTON_HOME_MISMATCH",
-                message,
+                "MISSING_DEP",
+                "Photon sidecar unavailable: install Node and run "
+                f"`cd {_SIDECAR_DIR} && npm install` "
+                "(or rerun `hermes photon quick-setup --phone '<phone>'`).",
+                retryable=False,
+            )
+            return False
+        if not self._autostart_sidecar:
+            self._set_fatal_error(
+                "SIDECAR_DISABLED",
+                "PHOTON_SIDECAR_AUTOSTART is disabled — the sidecar is the "
+                "only Photon transport, so the channel cannot run.",
                 retryable=False,
             )
             return False
 
-        hermes_home = _active_hermes_home_label()
-        logger.info("[photon] active Hermes home: %s", hermes_home)
-        logger.info(
-            "[photon] webhook public URL: %s",
-            self._webhook_public_url or "-",
-        )
-
-        # Start the aiohttp receiver first; without it the sidecar would
-        # be able to forward inbound traffic to a closed port.
-        try:
-            await self._start_webhook_server()
-        except OSError as e:
-            owner = _port_owner_hint(self._webhook_port)
-            detail = f"webhook port {self._webhook_port} unavailable: {e}"
-            if owner:
-                detail += f" ({owner})"
-            self._set_fatal_error(
-                "PORT_IN_USE",
-                detail,
-                retryable=True,
-            )
+        # One gateway per Spectrum project: two streams on the same project
+        # would double-deliver and double-reply.
+        if not self._acquire_platform_lock(
+            "photon", self._project_id, "Photon Spectrum project"
+        ):
             return False
 
-        if self._should_autostart_tunnel():
-            try:
-                await asyncio.to_thread(self._ensure_managed_tunnel_webhook)
-            except Exception as e:
-                self._set_fatal_error(
-                    "WEBHOOK_TUNNEL_FAILED",
-                    f"failed to start/register Photon webhook tunnel: {e}",
-                    retryable=True,
-                )
-                await asyncio.to_thread(self._stop_owned_managed_tunnel, force=True)
-                await self._stop_webhook_server()
-                return False
+        try:
+            await self._start_sidecar()
+        except Exception as e:
+            self._release_platform_lock()
+            self._set_fatal_error(
+                "SIDECAR_FAILED",
+                f"failed to start Photon sidecar: {e}",
+                retryable=True,
+            )
+            await self._stop_sidecar()
+            return False
 
-        # Spin up the Node sidecar (required for outbound).
-        if self._autostart_sidecar:
-            try:
-                await self._start_sidecar()
-            except Exception as e:
-                self._set_fatal_error(
-                    "SIDECAR_FAILED",
-                    f"failed to start Photon sidecar: {e}",
-                    retryable=True,
-                )
-                await asyncio.to_thread(self._stop_owned_managed_tunnel, force=True)
-                await self._stop_webhook_server()
-                return False
-        else:
-            logger.info("[photon] sidecar autostart disabled — outbound will fail")
-
-        self._http_client = httpx.AsyncClient(timeout=30.0)
         self._mark_connected()
         logger.info(
-            "[photon] connected — webhook at %s:%d%s, sidecar on %s:%d",
-            self._webhook_bind, self._webhook_port, self._webhook_path,
-            self._sidecar_bind, self._sidecar_port,
+            "[photon] connected via spectrum-ts gRPC stream (project %s, home %s)",
+            self._project_id,
+            get_hermes_home(),
         )
         return True
 
     async def disconnect(self) -> None:
+        self._closing = True
         await self._stop_sidecar()
-        self._stop_owned_managed_tunnel()
-        await self._stop_webhook_server()
-        if self._http_client is not None:
-            try:
-                await self._http_client.aclose()
-            except Exception:
-                pass
-            self._http_client = None
+        self._fail_pending("Photon adapter disconnected")
+        self._release_platform_lock()
         self._mark_disconnected()
 
-    # -- Webhook server ----------------------------------------------------
+    # -- Sidecar lifecycle -------------------------------------------------
 
-    async def _start_webhook_server(self) -> None:
-        app = web.Application()
-        app.router.add_post(self._webhook_path, self._handle_webhook)
-        app.router.add_get("/healthz", lambda _: web.Response(text="ok"))
-        self._runner = web.AppRunner(app)
-        await self._runner.setup()
-        site = web.TCPSite(self._runner, self._webhook_bind, self._webhook_port)
-        await site.start()
-
-    def _should_autostart_tunnel(self) -> bool:
-        if not self._autostart_tunnel:
-            return False
-        if self._webhook_public_url and not photon_tunnel.is_trycloudflare_url(
-            self._webhook_public_url
-        ):
-            logger.info(
-                "[photon] using user-owned webhook URL; managed tunnel autostart skipped"
+    async def _start_sidecar(self) -> None:
+        if not (_SIDECAR_DIR / "node_modules").exists():
+            raise RuntimeError(
+                f"Photon sidecar deps not installed. Run: "
+                f"cd {_SIDECAR_DIR} && npm install   "
+                "(or rerun `hermes photon quick-setup --phone '<phone>'`)"
             )
-            return False
-        return True
 
-    def _ensure_managed_tunnel_webhook(self) -> None:
-        result = photon_tunnel.start(
-            on_install=lambda msg: logger.info("[photon] %s", msg.strip())
+        self._closing = False
+        self._ready_event = asyncio.Event()
+        self._ready_error = None
+
+        env = _sidecar_process_env(
+            project_id=self._project_id,
+            project_secret=self._project_secret,
         )
-        if not result.success:
-            raise RuntimeError(result.error or "cloudflared did not start")
+        self._sidecar_proc = subprocess.Popen(  # noqa: S603
+            [self._node_bin, str(_SIDECAR_DIR / "index.mjs")],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            start_new_session=(sys.platform != "win32"),
+        )
+        self._sidecar_stdin = self._sidecar_proc.stdin
 
-        self._managed_tunnel_started = not result.reused
-        self._webhook_public_url = result.webhook_url
-        logger.info(
-            "[photon] %s managed webhook tunnel at %s",
-            "reused" if result.reused else "started",
-            result.webhook_url,
+        loop = asyncio.get_event_loop()
+        self._reader_task = loop.create_task(
+            self._read_sidecar_events(self._sidecar_proc.stdout)
+        )
+        self._stderr_task = loop.create_task(
+            self._pump_sidecar_stderr(self._sidecar_proc.stderr)
         )
 
         try:
-            hooks = list_webhooks(self._project_id, self._project_secret)
-            hooks = self._delete_stale_managed_webhooks(
-                hooks, keep_url=result.webhook_url
+            await asyncio.wait_for(
+                self._ready_event.wait(), timeout=_READY_TIMEOUT_SECONDS
             )
-            if any(_webhook_url(hook) == result.webhook_url for hook in hooks):
-                _save_env_value("PHOTON_WEBHOOK_PUBLIC_URL", result.webhook_url)
-                if self._webhook_secret:
-                    logger.info("[photon] managed webhook URL already registered")
-                    return
-                deleted = self._delete_matching_webhooks(
-                    hooks,
-                    result.webhook_url,
-                    reason="managed webhook with missing local signing secret",
+        except asyncio.TimeoutError:
+            raise RuntimeError(
+                f"Photon sidecar did not become ready within "
+                f"{int(_READY_TIMEOUT_SECONDS)}s"
+            )
+        if self._ready_error is not None:
+            code, message = self._ready_error
+            raise RuntimeError(f"Photon sidecar failed to start ({code}): {message}")
+
+    async def _read_sidecar_events(self, stdout: Any) -> None:
+        """Parse the sidecar's NDJSON stdout and dispatch events."""
+        loop = asyncio.get_event_loop()
+        while True:
+            line = await loop.run_in_executor(None, stdout.readline)
+            if not line:
+                break  # EOF — sidecar exited
+            text = line.decode("utf-8", "replace").strip()
+            if not text:
+                continue
+            try:
+                event = json.loads(text)
+            except json.JSONDecodeError:
+                logger.warning("[photon-sidecar] non-JSON stdout line: %s", text[:200])
+                continue
+            if not isinstance(event, dict):
+                continue
+            try:
+                self._handle_sidecar_event(event)
+            except Exception:
+                logger.exception("[photon] failed handling sidecar event")
+
+        # stdout closed — the sidecar process has gone away.
+        if self._ready_error is None and not self._ready_event.is_set():
+            self._ready_error = ("SIDECAR_EXITED", "sidecar exited before ready")
+            self._ready_event.set()
+        if not self._closing:
+            logger.error("[photon] sidecar stream closed unexpectedly")
+            self._fail_pending("Photon sidecar exited")
+            self._set_fatal_error(
+                "SIDECAR_EXITED",
+                "Photon sidecar exited unexpectedly",
+                retryable=True,
+            )
+            await self._notify_fatal_error()
+
+    def _handle_sidecar_event(self, event: Dict[str, Any]) -> None:
+        etype = event.get("type")
+        if etype == "ready":
+            if event.get("protocol") != _SIDECAR_PROTOCOL:
+                logger.warning(
+                    "[photon] sidecar protocol %s != expected %s",
+                    event.get("protocol"), _SIDECAR_PROTOCOL,
                 )
-                if not deleted:
-                    raise RuntimeError(
-                        "managed webhook URL is already registered but is not "
-                        "owned by this Hermes profile; refusing to delete it"
-                    )
-
-            data = register_webhook(
-                self._project_id,
-                self._project_secret,
-                webhook_url=result.webhook_url,
-            )
-            webhook_id = _webhook_id(data)
-            if webhook_id:
-                photon_tunnel.record_owned_webhook(webhook_id, result.webhook_url)
-            self._webhook_secret = str(
-                data.get("signingSecret") or data.get("secret") or self._webhook_secret
-            )
-            if not persist_webhook_signing_secret(
-                data,
-                on_summary=lambda msg: logger.info("[photon] %s", msg),
-            ):
-                raise RuntimeError("Photon returned no webhook signing secret")
-            _save_env_value("PHOTON_WEBHOOK_PUBLIC_URL", result.webhook_url)
-            logger.info("[photon] managed webhook registered for active gateway")
-        except Exception:
-            self._stop_owned_managed_tunnel(force=True)
-            raise
-
-    def _stop_owned_managed_tunnel(self, *, force: bool = False) -> None:
-        if not self._managed_tunnel_started:
+            self._ready_event.set()
             return
-        if not (force or self._stop_tunnel_on_disconnect):
+        if etype == "fatal":
+            self._ready_error = (
+                str(event.get("code") or "FATAL"),
+                str(event.get("error") or "sidecar reported a fatal error"),
+            )
+            self._ready_event.set()
             return
+        if etype == "message":
+            # Fire-and-forget: the reader must NOT await dispatch. handle_message
+            # may trigger an outbound send whose ack only this reader can
+            # deliver — awaiting inline would deadlock. Track the task so it is
+            # not garbage-collected while pending.
+            task = asyncio.ensure_future(self._dispatch_event(event))
+            self._inflight.add(task)
+            task.add_done_callback(self._inflight.discard)
+            return
+        if etype in ("sent", "error"):
+            self._resolve_pending(event)
+            return
+        logger.debug("[photon] ignoring sidecar event type %r", etype)
+
+    def _resolve_pending(self, event: Dict[str, Any]) -> None:
+        cid = event.get("cid")
+        if not cid:
+            if event.get("type") == "error":
+                logger.warning(
+                    "[photon-sidecar] stream error: %s", event.get("error")
+                )
+            return
+        future = self._pending.pop(cid, None)
+        if future is None or future.done():
+            return
+        if event.get("type") == "sent" and event.get("ok"):
+            future.set_result(event)
+        else:
+            future.set_exception(
+                RuntimeError(event.get("error") or "sidecar reported failure")
+            )
+
+    def _fail_pending(self, reason: str) -> None:
+        for cid, future in list(self._pending.items()):
+            if not future.done():
+                future.set_exception(RuntimeError(reason))
+            self._pending.pop(cid, None)
+
+    async def _pump_sidecar_stderr(self, stderr: Any) -> None:
+        """Pump the sidecar's stderr (its only log channel) into our logger."""
+        if stderr is None:
+            return
+        loop = asyncio.get_event_loop()
         try:
-            result = photon_tunnel.stop()
-            logger.info(
-                "[photon] managed webhook tunnel stopped: %s",
-                result.get("message"),
-            )
-        except Exception as e:
-            logger.warning("[photon] failed to stop managed webhook tunnel: %s", e)
-        finally:
-            self._managed_tunnel_started = False
+            while True:
+                line = await loop.run_in_executor(None, stderr.readline)
+                if not line:
+                    break
+                logger.info(
+                    "[photon-sidecar] %s", line.decode("utf-8", "replace").rstrip()
+                )
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("[photon-sidecar] stderr pump exited: %s", e)
 
-    def _delete_stale_managed_webhooks(self, hooks: list, *, keep_url: str) -> list:
-        deleted_ids: set[str] = set()
-        deleted_urls: set[str] = set()
-        owned_ids = photon_tunnel.owned_webhook_ids()
-        for hook in hooks:
-            url = _webhook_url(hook)
-            webhook_id = _webhook_id(hook)
-            if (
-                not url
-                or url == keep_url
-                or not webhook_id
-                or webhook_id not in owned_ids
-                or not photon_tunnel.is_trycloudflare_url(url)
-            ):
-                continue
+    async def _stop_sidecar(self) -> None:
+        proc = self._sidecar_proc
+        # Closing stdin signals the sidecar to shut down gracefully (EOF).
+        if self._sidecar_stdin is not None:
             try:
-                delete_webhook(
-                    self._project_id,
-                    self._project_secret,
-                    webhook_id=webhook_id,
-                )
-            except Exception as e:
-                logger.warning(
-                    "[photon] could not delete stale managed webhook %s: %s",
-                    webhook_id,
-                    e,
-                )
-                continue
-            deleted_ids.add(webhook_id)
-            deleted_urls.add(url)
-            photon_tunnel.forget_owned_webhook(webhook_id)
-            logger.info("[photon] deleted stale managed webhook: %s", webhook_id)
-        if not deleted_ids and not deleted_urls:
-            return hooks
-        return [
-            hook for hook in hooks
-            if _webhook_id(hook) not in deleted_ids
-            and _webhook_url(hook) not in deleted_urls
-        ]
-
-    def _delete_matching_webhooks(self, hooks: list, url: str, *, reason: str) -> int:
-        owned_ids = photon_tunnel.owned_webhook_ids()
-        deleted = 0
-        for hook in hooks:
-            if _webhook_url(hook) != url:
-                continue
-            webhook_id = _webhook_id(hook)
-            if not webhook_id:
-                continue
-            if webhook_id not in owned_ids:
-                logger.warning(
-                    "[photon] refusing to delete unowned %s: %s",
-                    reason,
-                    webhook_id,
-                )
-                continue
-            delete_webhook(
-                self._project_id,
-                self._project_secret,
-                webhook_id=webhook_id,
-            )
-            photon_tunnel.forget_owned_webhook(webhook_id)
-            deleted += 1
-            logger.info("[photon] deleted %s: %s", reason, webhook_id)
-        return deleted
-
-    async def _stop_webhook_server(self) -> None:
-        if self._runner is not None:
-            try:
-                await self._runner.cleanup()
+                await self._write_command_line({"type": "shutdown"})
             except Exception:
                 pass
-            self._runner = None
+            try:
+                self._sidecar_stdin.close()
+            except Exception:
+                pass
+            self._sidecar_stdin = None
+        if proc is not None:
+            try:
+                proc.wait(timeout=3.0)
+            except subprocess.TimeoutExpired:
+                if sys.platform != "win32":
+                    try:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                    except (ProcessLookupError, PermissionError):
+                        proc.terminate()
+                else:
+                    proc.terminate()
+                try:
+                    proc.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            self._sidecar_proc = None
+        for task in (self._reader_task, self._stderr_task):
+            if task is not None:
+                task.cancel()
+        self._reader_task = None
+        self._stderr_task = None
 
-    async def _handle_webhook(self, request: "web.Request") -> "web.Response":
-        body = await request.read()
-        logger.info(
-            "[photon] webhook delivery received: bytes=%d remote=%s",
-            len(body),
-            request.remote or "-",
-        )
-        if self._webhook_secret:
-            ts = request.headers.get("X-Spectrum-Timestamp", "")
-            sig = request.headers.get("X-Spectrum-Signature", "")
-            if not verify_signature(
-                body=body,
-                timestamp_header=ts,
-                signature_header=sig,
-                signing_secret=self._webhook_secret,
-            ):
-                logger.warning("[photon] rejected webhook with bad signature")
-                return web.Response(status=401, text="invalid signature")
-        else:
-            logger.warning(
-                "[photon] PHOTON_WEBHOOK_SECRET unset — accepting unsigned "
-                "deliveries. Set the per-URL signing secret returned by "
-                "register-webhook to enable verification."
-            )
+    # -- Inbound -----------------------------------------------------------
 
+    async def _dispatch_event(self, event: Dict[str, Any]) -> None:
+        msg_id = event.get("id")
+        if msg_id and self._is_duplicate(str(msg_id)):
+            logger.info("[photon] duplicate inbound ignored: message_id=%s", msg_id)
+            return
+        message_event = self._event_to_message_event(event)
+        if message_event is None:
+            return
         try:
-            payload = json.loads(body or b"{}")
-        except json.JSONDecodeError:
-            logger.warning("[photon] rejected webhook with invalid json")
-            return web.Response(status=400, text="invalid json")
-        event_type = payload.get("event")
-        msg = payload.get("message") or {}
-        msg_id = msg.get("id")
-        space = msg.get("space") or payload.get("space") or {}
-        logger.info(
-            "[photon] webhook event=%s message_id=%s space=%s",
-            event_type or "-",
-            msg_id or "-",
-            space.get("id") or "-",
-        )
-        if payload.get("event") != "messages":
-            # Photon currently emits only `messages`; any future event
-            # types are ack'd 200 so they don't retry.
-            return web.Response(text="ok")
-
-        if not msg_id:
-            logger.warning("[photon] rejected webhook missing message.id")
-            return web.Response(status=400, text="missing message.id")
-        if self._is_duplicate(msg_id):
-            logger.info("[photon] duplicate webhook ignored: message_id=%s", msg_id)
-            return web.Response(text="ok (dup)")
-
-        try:
-            await self._dispatch_inbound(payload)
+            await self.handle_message(message_event)
         except Exception:
             logger.exception("[photon] inbound dispatch failed")
-            # 200 anyway — we own the dedup; failing here would cause
-            # Photon to retry the same id.
-        return web.Response(text="ok")
 
-    def _is_duplicate(self, msg_id: str) -> bool:
-        now = time.time()
-        if len(self._seen_messages) > _DEDUP_MAX_SIZE:
-            cutoff = now - _DEDUP_WINDOW_SECONDS
-            self._seen_messages = {
-                k: v for k, v in self._seen_messages.items() if v > cutoff
-            }
-        if msg_id in self._seen_messages:
-            return True
-        self._seen_messages[msg_id] = now
-        return False
+    def _event_to_message_event(self, event: Dict[str, Any]) -> Optional[MessageEvent]:
+        """Normalize a sidecar ``message`` event into a MessageEvent.
 
-    async def _dispatch_inbound(self, payload: Dict[str, Any]) -> None:
-        msg = payload.get("message") or {}
-        space = msg.get("space") or payload.get("space") or {}
-        sender = msg.get("sender") or {}
-        content = msg.get("content") or {}
-
-        space_id = space.get("id") or ""
-        sender_id = sender.get("id") or ""
+        Pure/synchronous so it is unit-testable without a running sidecar or
+        event loop.
+        """
+        space_id = event.get("spaceId") or ""
         if not space_id:
-            logger.warning("[photon] inbound missing space.id")
-            return
+            logger.warning("[photon] inbound missing spaceId")
+            return None
+        sender_id = event.get("sender") or ""
+        content = event.get("content") or {}
 
-        # Space type — Photon documents iMessage DM ids as `any;-;+E164`
-        # and group ids as `any;+;<chat-guid>`.  Use that as the
-        # heuristic; everything else is treated as DM.
+        # Photon documents iMessage DM ids as `any;-;+E164` and group ids as
+        # `any;+;<chat-guid>`. Use the group marker as the heuristic.
         chat_type = "group" if ";+;" in space_id else "dm"
 
-        # Timestamp — ISO 8601 from the platform.
-        ts_str = msg.get("timestamp") or ""
+        ts_str = event.get("timestamp") or ""
         try:
-            timestamp = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+            timestamp = datetime.fromisoformat(str(ts_str).replace("Z", "+00:00"))
         except ValueError:
             timestamp = datetime.now(tz=timezone.utc)
 
-        # Content normalization.  Spectrum is a discriminated union;
-        # text vs attachment metadata.  Attachments are metadata-only
-        # today (no download URL) — log + carry the name so the agent
-        # at least knows something was sent.
         if content.get("type") == "text":
             text = content.get("text") or ""
             mtype = MessageType.TEXT
@@ -794,120 +521,26 @@ class PhotonAdapter(BasePlatformAdapter):
             user_id=sender_id or space_id,
             user_name=sender_id or None,
         )
-        event = MessageEvent(
+        return MessageEvent(
             text=text,
             message_type=mtype,
             source=source,
-            message_id=msg.get("id"),
-            raw_message=payload,
+            message_id=event.get("id"),
+            raw_message=event,
             timestamp=timestamp,
         )
-        await self.handle_message(event)
 
-    # -- Sidecar lifecycle -------------------------------------------------
-
-    async def _start_sidecar(self) -> None:
-        if not (_SIDECAR_DIR / "node_modules").exists():
-            raise RuntimeError(
-                f"Photon sidecar deps not installed. Run: "
-                f"cd {_SIDECAR_DIR} && npm install   "
-                "(or rerun `hermes photon quick-setup --phone '<phone>'`)"
-            )
-        env = _sidecar_process_env(
-            project_id=self._project_id,
-            project_secret=self._project_secret,
-            sidecar_port=self._sidecar_port,
-            sidecar_bind=self._sidecar_bind,
-            sidecar_token=self._sidecar_token,
-        )
-
-        self._sidecar_proc = subprocess.Popen(  # noqa: S603
-            [self._node_bin, str(_SIDECAR_DIR / "index.mjs")],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            env=env,
-            start_new_session=(sys.platform != "win32"),
-        )
-
-        # Pump sidecar stderr/stdout into our logger so users see crashes.
-        loop = asyncio.get_event_loop()
-        self._sidecar_supervisor_task = loop.create_task(
-            self._supervise_sidecar(self._sidecar_proc)
-        )
-
-        # Wait for /healthz to come up — give it up to 15s on cold start.
-        deadline = time.time() + 15.0
-        last_err: Optional[Exception] = None
-        async with httpx.AsyncClient(timeout=2.0) as client:
-            while time.time() < deadline:
-                if self._sidecar_proc.poll() is not None:
-                    raise RuntimeError(
-                        f"Photon sidecar exited with code "
-                        f"{self._sidecar_proc.returncode} before becoming ready"
-                    )
-                try:
-                    resp = await client.post(
-                        f"http://{self._sidecar_bind}:{self._sidecar_port}/healthz",
-                        headers={"X-Hermes-Sidecar-Token": self._sidecar_token},
-                    )
-                    if resp.status_code == 200:
-                        return
-                except httpx.RequestError as e:
-                    last_err = e
-                await asyncio.sleep(0.2)
-        raise RuntimeError(
-            f"Photon sidecar did not become ready within 15s: {last_err}"
-        )
-
-    async def _supervise_sidecar(self, proc: subprocess.Popen) -> None:
-        """Pump the sidecar's stdout/stderr into our logger."""
-        if proc.stdout is None:  # subprocess was launched without stdout=PIPE
-            return
-        stdout = proc.stdout
-        loop = asyncio.get_event_loop()
-        try:
-            while True:
-                line = await loop.run_in_executor(None, stdout.readline)
-                if not line:
-                    break
-                logger.info("[photon-sidecar] %s", line.decode("utf-8", "replace").rstrip())
-        except Exception as e:  # pragma: no cover - defensive
-            logger.warning("[photon-sidecar] supervisor exited: %s", e)
-
-    async def _stop_sidecar(self) -> None:
-        proc = self._sidecar_proc
-        if proc is None:
-            return
-        try:
-            # Polite shutdown first.
-            if self._http_client is not None:
-                try:
-                    await self._http_client.post(
-                        f"http://{self._sidecar_bind}:{self._sidecar_port}/shutdown",
-                        headers={"X-Hermes-Sidecar-Token": self._sidecar_token},
-                        timeout=2.0,
-                    )
-                except Exception:
-                    pass
-            try:
-                proc.wait(timeout=3.0)
-            except subprocess.TimeoutExpired:
-                if sys.platform != "win32":
-                    try:
-                        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)  # windows-footgun: ok
-                    except (ProcessLookupError, PermissionError):
-                        proc.terminate()
-                else:
-                    proc.terminate()
-                try:
-                    proc.wait(timeout=2.0)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-        finally:
-            self._sidecar_proc = None
-            if self._sidecar_supervisor_task is not None:
-                self._sidecar_supervisor_task.cancel()
-                self._sidecar_supervisor_task = None
+    def _is_duplicate(self, msg_id: str) -> bool:
+        now = time.time()
+        if len(self._seen_messages) > _DEDUP_MAX_SIZE:
+            cutoff = now - _DEDUP_WINDOW_SECONDS
+            self._seen_messages = {
+                k: v for k, v in self._seen_messages.items() if v > cutoff
+            }
+        if msg_id in self._seen_messages:
+            return True
+        self._seen_messages[msg_id] = now
+        return False
 
     # -- Outbound ----------------------------------------------------------
 
@@ -918,11 +551,23 @@ class PhotonAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        return await self._sidecar_send(chat_id, content, reply_to=reply_to)
+        if len(content) > self.MAX_MESSAGE_LENGTH:
+            logger.warning(
+                "[photon] truncating outbound from %d to %d chars",
+                len(content), self.MAX_MESSAGE_LENGTH,
+            )
+            content = content[: self.MAX_MESSAGE_LENGTH]
+        try:
+            data = await self._send_command(
+                "send", spaceId=chat_id, text=content, replyTo=reply_to
+            )
+        except Exception as e:
+            return SendResult(success=False, error=str(e), retryable=True)
+        return SendResult(success=True, message_id=data.get("messageId"))
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         try:
-            await self._sidecar_call("/typing", {"spaceId": chat_id})
+            await self._send_command("typing", spaceId=chat_id)
         except Exception as e:
             logger.debug("[photon] send_typing failed: %s", e)
 
@@ -930,72 +575,44 @@ class PhotonAdapter(BasePlatformAdapter):
         """Return whatever we know about a Spectrum space id.
 
         Photon's `space.id` is opaque (`any;-;+E164` for DMs,
-        `any;+;<guid>` for groups). We surface that shape directly so
-        the gateway has something to show in session pickers / logs.
+        `any;+;<guid>` for groups). We surface that shape directly so the
+        gateway has something to show in session pickers / logs.
         """
         chat_type = "group" if ";+;" in chat_id else "dm"
         return {"name": chat_id, "type": chat_type, "id": chat_id}
 
-    async def _sidecar_send(
-        self, space_id: str, text: str, *, reply_to: Optional[str] = None,
-    ) -> SendResult:
-        if len(text) > self.MAX_MESSAGE_LENGTH:
-            logger.warning(
-                "[photon] truncating outbound from %d to %d chars",
-                len(text), self.MAX_MESSAGE_LENGTH,
-            )
-            text = text[: self.MAX_MESSAGE_LENGTH]
-        body: Dict[str, Any] = {"spaceId": space_id, "text": text}
-        if reply_to:
-            body["replyTo"] = reply_to
+    async def _send_command(self, command: str, **fields: Any) -> Dict[str, Any]:
+        if self._sidecar_stdin is None or self._sidecar_proc is None:
+            raise RuntimeError("Photon sidecar not running")
+        cid = uuid.uuid4().hex
+        loop = asyncio.get_event_loop()
+        future: asyncio.Future = loop.create_future()
+        self._pending[cid] = future
+        payload = {"type": command, "cid": cid, **fields}
         try:
-            data = await self._sidecar_call("/send", body)
-        except Exception as e:
-            return SendResult(success=False, error=str(e))
-        return SendResult(success=True, message_id=data.get("messageId"))
+            await self._write_command_line(payload)
+            return await asyncio.wait_for(future, timeout=_SEND_TIMEOUT_SECONDS)
+        finally:
+            self._pending.pop(cid, None)
 
-    async def _sidecar_call(self, path: str, body: Dict[str, Any]) -> Dict[str, Any]:
-        if self._http_client is None:
-            raise RuntimeError("Photon adapter not connected")
-        resp = await self._http_client.post(
-            f"http://{self._sidecar_bind}:{self._sidecar_port}{path}",
-            json=body,
-            headers={"X-Hermes-Sidecar-Token": self._sidecar_token},
-            timeout=30.0,
-        )
-        if resp.status_code != 200:
-            raise RuntimeError(
-                f"Photon sidecar {path} returned {resp.status_code}: {resp.text[:200]}"
-            )
-        data = resp.json() or {}
-        if not data.get("ok"):
-            raise RuntimeError(
-                f"Photon sidecar {path} reported error: {data.get('error')}"
-            )
-        return data
+    async def _write_command_line(self, payload: Dict[str, Any]) -> None:
+        stdin = self._sidecar_stdin
+        if stdin is None:
+            raise RuntimeError("Photon sidecar stdin closed")
+        data = (json.dumps(payload) + "\n").encode("utf-8")
+        loop = asyncio.get_event_loop()
+
+        def _write() -> None:
+            stdin.write(data)
+            stdin.flush()
+
+        await loop.run_in_executor(None, _write)
 
 
 # ---------------------------------------------------------------------------
-# Helpers
-
-def _attachment_message_type(mime: str) -> MessageType:
-    mime = (mime or "").lower()
-    if mime.startswith("image/"):
-        return MessageType.PHOTO
-    if mime.startswith("video/"):
-        return MessageType.VIDEO
-    if mime.startswith("audio/"):
-        return MessageType.AUDIO
-    if mime.startswith("application/"):
-        return MessageType.DOCUMENT
-    return MessageType.DOCUMENT
-
-
-# ---------------------------------------------------------------------------
-# Standalone (out-of-process) send for cron deliveries when the gateway
-# is not co-resident.  Spins up an ephemeral sidecar call by spawning
-# the existing sidecar binary one-shot; if a live sidecar is already
-# listening on the configured port we reuse it.
+# Standalone (out-of-process) send for cron deliveries when the gateway is not
+# co-resident.  Spawns a one-shot sidecar, waits for ready, sends one message,
+# then closes stdin so the sidecar shuts down.
 
 async def _standalone_send(
     pconfig: PlatformConfig,
@@ -1006,37 +623,89 @@ async def _standalone_send(
     media_files: Optional[list] = None,  # noqa: ARG001 — attachment send not supported yet
     force_document: bool = False,  # noqa: ARG001
 ) -> Dict[str, Any]:
-    if not HTTPX_AVAILABLE:
-        return {"error": "httpx not installed"}
-    port = _coerce_port(
-        (pconfig.extra or {}).get("sidecar_port") or os.getenv("PHOTON_SIDECAR_PORT"),
-        _DEFAULT_SIDECAR_PORT,
+    extra = pconfig.extra or {}
+    stored_id, stored_sec = load_project_credentials()
+    project_id = (
+        os.getenv("PHOTON_PROJECT_ID") or extra.get("project_id") or stored_id or ""
     )
-    token = os.getenv("PHOTON_SIDECAR_TOKEN")
-    if not token:
-        return {
-            "error": (
-                "Photon standalone send requires a running sidecar with "
-                "PHOTON_SIDECAR_TOKEN set in the environment. Cron processes "
-                "cannot spawn the sidecar themselves."
-            )
-        }
-    body: Dict[str, Any] = {"spaceId": chat_id, "text": message[:_MAX_MESSAGE_LENGTH]}
+    project_secret = (
+        os.getenv("PHOTON_PROJECT_SECRET")
+        or extra.get("project_secret")
+        or stored_sec
+        or ""
+    )
+    if not (project_id and project_secret):
+        return {"error": "PHOTON_PROJECT_ID and PHOTON_PROJECT_SECRET are required"}
+    if not check_requirements():
+        return {"error": "Photon sidecar unavailable (install Node + run npm install)"}
+
+    node_bin = os.getenv("PHOTON_NODE_BIN") or shutil.which("node") or "node"
+    env = _sidecar_process_env(project_id=project_id, project_secret=project_secret)
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(
-                f"http://{_DEFAULT_SIDECAR_BIND}:{port}/send",
-                json=body,
-                headers={"X-Hermes-Sidecar-Token": token},
-            )
-        if resp.status_code != 200:
-            return {"error": f"sidecar returned {resp.status_code}: {resp.text[:200]}"}
-        data = resp.json() or {}
-        if not data.get("ok"):
-            return {"error": data.get("error") or "sidecar reported failure"}
-        return {"success": True, "message_id": data.get("messageId")}
+        proc = await asyncio.create_subprocess_exec(
+            node_bin,
+            str(_SIDECAR_DIR / "index.mjs"),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            env=env,
+        )
+    except Exception as e:
+        return {"error": f"Photon sidecar spawn failed: {e}"}
+
+    async def _read_until(*, cid: Optional[str], want_ready: bool) -> Dict[str, Any]:
+        while True:
+            raw = await proc.stdout.readline()
+            if not raw:
+                raise RuntimeError("sidecar exited before responding")
+            try:
+                event = json.loads(raw.decode("utf-8", "replace").strip())
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            etype = event.get("type")
+            if want_ready and etype == "ready":
+                return event
+            if etype == "fatal":
+                raise RuntimeError(event.get("error") or "sidecar fatal error")
+            if cid and etype in ("sent", "error") and event.get("cid") == cid:
+                return event
+
+    try:
+        await asyncio.wait_for(
+            _read_until(cid=None, want_ready=True), timeout=_READY_TIMEOUT_SECONDS
+        )
+        cid = uuid.uuid4().hex
+        cmd = {
+            "type": "send",
+            "cid": cid,
+            "spaceId": chat_id,
+            "text": message[:_MAX_MESSAGE_LENGTH],
+        }
+        proc.stdin.write((json.dumps(cmd) + "\n").encode("utf-8"))
+        await proc.stdin.drain()
+        result = await asyncio.wait_for(
+            _read_until(cid=cid, want_ready=False), timeout=_SEND_TIMEOUT_SECONDS
+        )
+        if result.get("type") == "sent" and result.get("ok"):
+            return {"success": True, "message_id": result.get("messageId")}
+        return {"error": result.get("error") or "sidecar reported failure"}
     except Exception as e:
         return {"error": f"Photon standalone send failed: {e}"}
+    finally:
+        try:
+            if proc.stdin and not proc.stdin.is_closing():
+                proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=5.0)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -1057,8 +726,8 @@ def register(ctx) -> None:
         install_hint=(
             "Run `hermes photon login`, then `hermes photon quick-setup "
             "--phone '+<country-code><number>'` to create/adopt a Spectrum "
-            "project, link your phone number, install the sidecar, and "
-            "register a managed webhook tunnel."
+            "project, link your phone number, and install the sidecar that "
+            "streams iMessage over Photon's gRPC gateway."
         ),
         setup_fn=_cli.interactive_setup,
         env_enablement_fn=_env_enablement,

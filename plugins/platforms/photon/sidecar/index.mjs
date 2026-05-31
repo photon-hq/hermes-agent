@@ -1,71 +1,86 @@
 // Hermes Agent — Photon Spectrum sidecar
 //
-// Spawned by `plugins/platforms/photon/adapter.py` to bridge outbound
-// messaging to Photon's Spectrum platform. Inbound messages go directly
-// from Photon's webhook to Hermes' Python aiohttp receiver — this
-// sidecar handles ONLY outbound calls (which require the spectrum-ts
-// SDK because Photon has no public HTTP send endpoint today).
+// Spawned by `plugins/platforms/photon/adapter.py` to bridge Hermes <-> Photon
+// Spectrum (iMessage) through the `spectrum-ts` SDK's managed gRPC gateway.
+// This sidecar is the SOLE transport for the channel — there are no webhooks:
 //
-// Protocol:
-//   - The sidecar listens on http://127.0.0.1:${PORT} (loopback only)
-//   - Each request must include `X-Hermes-Sidecar-Token: ${TOKEN}`
-//   - POST /healthz                     -> {"ok": true}
-//   - POST /send                        -> {"ok": true, "messageId": "..."}
-//       body: {"spaceId": "...", "text": "...", "replyTo": "..." | null}
-//   - POST /typing                      -> {"ok": true}
-//       body: {"spaceId": "..."}
-//   - POST /shutdown                    -> {"ok": true}; then process exits
+//   - Inbound messages arrive on the SDK's `app.messages` async stream and are
+//     emitted to stdout as newline-delimited JSON (NDJSON) events.
+//   - Outbound commands arrive on stdin as NDJSON and are dispatched through
+//     the SDK (`space.send`, typing).
 //
-// On SIGINT/SIGTERM the sidecar calls `app.stop()` (3s graceful) before
-// exiting. Errors are logged to stderr; Python supervises restart.
+// Protocol (NDJSON — one JSON object per line, UTF-8):
+//   stdout events (sidecar -> Hermes):
+//     {"type":"ready","protocol":1}
+//     {"type":"message","id","spaceId","sender","platform","content":{...},"timestamp"}
+//     {"type":"sent","cid","ok":true,"messageId"}
+//     {"type":"error","cid"|null,"ok":false,"error","code"}
+//     {"type":"fatal","error","code"}            (emitted before a startup exit)
+//   stdin commands (Hermes -> sidecar):
+//     {"type":"send","cid","spaceId","text","replyTo"|null}
+//     {"type":"typing","cid","spaceId"}
+//     {"type":"shutdown"}
 //
-// Env vars (all required):
-//   PHOTON_PROJECT_ID
-//   PHOTON_PROJECT_SECRET
-//   PHOTON_SIDECAR_PORT
-//   PHOTON_SIDECAR_TOKEN
+// Discipline: stdout carries ONLY NDJSON events; every diagnostic goes to
+// stderr (`console.error`). Closing stdin (EOF) triggers graceful shutdown, so
+// the sidecar dies with its parent without any explicit signal.
 //
-// Optional:
-//   PHOTON_SIDECAR_BIND  (default 127.0.0.1)
-//   PHOTON_API_HOST      (passed through to spectrum-ts if its config
-//                         honours it)
+// Env vars (required): PHOTON_PROJECT_ID, PHOTON_PROJECT_SECRET
+// Optional:            PHOTON_API_HOST (passed through if spectrum-ts honours it)
 
-import http from "node:http";
+import readline from "node:readline";
+
+const PROTOCOL_VERSION = 1;
 
 const projectId = process.env.PHOTON_PROJECT_ID;
 const projectSecret = process.env.PHOTON_PROJECT_SECRET;
-const port = parseInt(process.env.PHOTON_SIDECAR_PORT || "8789", 10);
-const bind = process.env.PHOTON_SIDECAR_BIND || "127.0.0.1";
-const sharedToken = process.env.PHOTON_SIDECAR_TOKEN;
 
-if (!projectId || !projectSecret || !sharedToken) {
-  console.error(
-    "photon-sidecar: PHOTON_PROJECT_ID, PHOTON_PROJECT_SECRET and " +
-      "PHOTON_SIDECAR_TOKEN must all be set."
-  );
+function emit(obj) {
+  // The single sink for stdout — only ever a structured event line.
+  process.stdout.write(JSON.stringify(obj) + "\n");
+}
+
+function log(...args) {
+  console.error("photon-sidecar:", ...args);
+}
+
+if (!projectId || !projectSecret) {
+  log("PHOTON_PROJECT_ID and PHOTON_PROJECT_SECRET must both be set.");
+  emit({ type: "fatal", error: "missing project credentials", code: "MISSING_CREDENTIALS" });
   process.exit(2);
 }
 
-// Lazy-load spectrum-ts so a missing install fails with a clear message
-// instead of a cryptic module-resolution error during import.
+// Lazy-load spectrum-ts so a missing install fails with a clear, structured
+// signal instead of a cryptic module-resolution error during import.
 let Spectrum, imessage, spectrumText;
 try {
   ({ Spectrum, text: spectrumText } = await import("spectrum-ts"));
   ({ imessage } = await import("spectrum-ts/providers/imessage"));
 } catch (e) {
-  console.error(
-    "photon-sidecar: spectrum-ts is not installed. Run `npm install` " +
-      "inside plugins/platforms/photon/sidecar/. Original error: " +
+  log(
+    "spectrum-ts is not installed. Run `npm install` inside " +
+      "plugins/platforms/photon/sidecar/. Original error: " +
       (e && e.stack ? e.stack : String(e))
   );
+  emit({ type: "fatal", error: "spectrum-ts not installed", code: "SPECTRUM_TS_MISSING" });
   process.exit(3);
 }
 
-const app = await Spectrum({
-  projectId,
-  projectSecret,
-  providers: [imessage.config()],
-});
+let app;
+try {
+  app = await Spectrum({
+    projectId,
+    projectSecret,
+    providers: [imessage.config()],
+  });
+} catch (e) {
+  log("Spectrum() initialization failed: " + (e && e.stack ? e.stack : String(e)));
+  emit({ type: "fatal", error: String((e && e.message) || e), code: "SPECTRUM_INIT_FAILED" });
+  process.exit(4);
+}
+
+// ---------------------------------------------------------------------------
+// Space resolution / caching
 
 const cachedSpaces = new Map();
 
@@ -77,72 +92,11 @@ function cacheSpace(space) {
 
 function dmAddressFromSpaceId(spaceId) {
   if (typeof spaceId !== "string") return null;
-  // Webhooks carry canonical space ids such as `any;-;+<phone>`.
+  // Spectrum carries canonical space ids such as `any;-;+<phone>` for DMs.
   // The iMessage helper resolves uncached DMs by recipient address.
   if (spaceId.startsWith("any;-;")) return spaceId.slice("any;-;".length);
   if (spaceId.startsWith("+")) return spaceId;
   return null;
-}
-
-// Drain the inbound stream — Photon's webhook is the canonical inbound
-// path, but we still consume `app.messages` so spectrum-ts' internal
-// reconnect/heartbeat logic keeps running.  Each event is logged at
-// debug level; everything else is a no-op here.
-(async () => {
-  try {
-    for await (const [space, message] of app.messages) {
-      cacheSpace(space);
-      console.error(
-        `photon-sidecar: observed SDK inbound from ${message.platform} ` +
-          `(Hermes dispatches inbound only from signed webhooks) ` +
-          `space=${message.space?.id}`
-      );
-    }
-  } catch (e) {
-    console.error(
-      "photon-sidecar: inbound stream errored: " +
-        (e && e.stack ? e.stack : String(e))
-    );
-  }
-})();
-
-async function readBody(req) {
-  const chunks = [];
-  for await (const chunk of req) chunks.push(chunk);
-  const raw = Buffer.concat(chunks).toString("utf-8");
-  if (!raw) return {};
-  try {
-    return JSON.parse(raw);
-  } catch (e) {
-    throw new Error("invalid JSON body");
-  }
-}
-
-function unauthorized(res) {
-  res.statusCode = 401;
-  res.setHeader("Content-Type", "application/json");
-  res.end(JSON.stringify({ ok: false, error: "unauthorized" }));
-}
-
-function badRequest(res, msg) {
-  res.statusCode = 400;
-  res.setHeader("Content-Type", "application/json");
-  res.end(JSON.stringify({ ok: false, error: msg }));
-}
-
-function serverError(res) {
-  res.statusCode = 500;
-  res.setHeader("Content-Type", "application/json");
-  // Don't leak stack traces or raw exception text to the caller — even
-  // though we listen on loopback, the supervisor logs the real error
-  // and the client only needs a generic failure signal.
-  res.end(JSON.stringify({ ok: false, error: "internal sidecar error" }));
-}
-
-function ok(res, data) {
-  res.statusCode = 200;
-  res.setHeader("Content-Type", "application/json");
-  res.end(JSON.stringify({ ok: true, ...data }));
 }
 
 async function resolveSpace(spaceId) {
@@ -158,83 +112,205 @@ async function resolveSpace(spaceId) {
       return space;
     }
   }
-
   throw new Error(`unable to resolve space id ${spaceId}`);
 }
 
-const server = http.createServer(async (req, res) => {
-  if (req.headers["x-hermes-sidecar-token"] !== sharedToken) {
-    return unauthorized(res);
+// ---------------------------------------------------------------------------
+// Self-echo suppression
+//
+// spectrum-ts may re-deliver our own outbound on `app.messages` (iMessage
+// shows sent messages in the conversation). Track the ids we just sent and
+// drop them from the inbound stream so the agent never replies to itself.
+
+const recentlySent = new Map(); // messageId -> epoch ms
+const SENT_TTL_MS = 5 * 60 * 1000;
+
+function rememberSent(id) {
+  if (id) recentlySent.set(id, Date.now());
+}
+
+function wasSelfSent(id) {
+  if (!id) return false;
+  const cutoff = Date.now() - SENT_TTL_MS;
+  for (const [key, ts] of recentlySent) {
+    if (ts < cutoff) recentlySent.delete(key);
   }
-  if (req.method !== "POST") {
-    res.statusCode = 405;
-    return res.end();
+  return recentlySent.has(id);
+}
+
+// ---------------------------------------------------------------------------
+// Inbound normalization
+
+function normalizeContent(content) {
+  if (!content || typeof content !== "object") {
+    return { type: "unknown" };
+  }
+  if (content.type === "text") {
+    return { type: "text", text: typeof content.text === "string" ? content.text : "" };
+  }
+  if (content.type === "attachment") {
+    return {
+      type: "attachment",
+      name: content.name ?? null,
+      mimeType: content.mimeType ?? null,
+      size: typeof content.size === "number" ? content.size : null,
+      attachmentId: content.id ?? content.attachmentId ?? null,
+    };
+  }
+  return { type: content.type || "unknown" };
+}
+
+function messageToEvent(space, message) {
+  let timestamp = null;
+  const ts = message && message.timestamp;
+  if (ts instanceof Date) timestamp = ts.toISOString();
+  else if (typeof ts === "string") timestamp = ts;
+  else if (typeof ts === "number") timestamp = new Date(ts).toISOString();
+
+  return {
+    type: "message",
+    id: (message && message.id) ?? null,
+    spaceId: (space && space.id) ?? (message && message.space && message.space.id) ?? null,
+    sender: (message && message.sender && message.sender.id) ?? null,
+    platform: (message && message.platform) ?? "imessage",
+    content: normalizeContent(message && message.content),
+    timestamp,
+    fromMe: Boolean(
+      (message && (message.fromMe ?? message.isFromMe ?? message.outgoing)) || false
+    ),
+  };
+}
+
+// Consume the inbound gRPC stream. Each event is emitted to stdout; the Python
+// adapter normalizes it into a MessageEvent and dispatches it to the gateway.
+(async () => {
+  try {
+    for await (const [space, message] of app.messages) {
+      cacheSpace(space);
+      try {
+        const event = messageToEvent(space, message);
+        if (event.fromMe || wasSelfSent(event.id)) {
+          continue; // our own outbound echoed back — never re-dispatch it
+        }
+        emit(event);
+      } catch (e) {
+        log("failed to normalize inbound message: " + (e && e.stack ? e.stack : String(e)));
+      }
+    }
+    log("inbound stream ended");
+  } catch (e) {
+    log("inbound stream errored: " + (e && e.stack ? e.stack : String(e)));
+    emit({
+      type: "error",
+      cid: null,
+      ok: false,
+      error: String((e && e.message) || e),
+      code: "STREAM_ERROR",
+    });
+  }
+})();
+
+// Signal readiness once Spectrum is initialized and we are listening.
+emit({ type: "ready", protocol: PROTOCOL_VERSION });
+log("ready — streaming spectrum-ts inbound, awaiting stdin commands");
+
+// ---------------------------------------------------------------------------
+// Outbound command handling
+
+async function handleSend(cmd) {
+  const cid = cmd.cid ?? null;
+  const { spaceId, text } = cmd;
+  if (!spaceId || typeof text !== "string") {
+    emit({ type: "error", cid, ok: false, error: "spaceId and text are required", code: "BAD_COMMAND" });
+    return;
+  }
+  if (cmd.replyTo) {
+    log("replyTo ignored for outbound text; sending plain message");
   }
   try {
-    if (req.url === "/healthz") {
-      return ok(res, {});
-    }
-    if (req.url === "/shutdown") {
-      ok(res, {});
-      setTimeout(() => process.kill(process.pid, "SIGTERM"), 50);
-      return;
-    }
-    const body = await readBody(req);
-    if (req.url === "/send") {
-      const { spaceId, text: messageText, replyTo } = body || {};
-      if (!spaceId || typeof messageText !== "string") {
-        return badRequest(res, "spaceId and text are required");
-      }
-      const space = await resolveSpace(spaceId);
-      if (replyTo) {
-        console.error(
-          "photon-sidecar: replyTo ignored for outbound text; sending plain message"
-        );
-      }
-      const result = await space.send(spectrumText(messageText));
-      return ok(res, { messageId: result?.id || result?.messageId || null });
-    }
-    if (req.url === "/typing") {
-      const { spaceId } = body || {};
-      if (!spaceId) return badRequest(res, "spaceId is required");
-      const space = await resolveSpace(spaceId);
-      if (typeof space.typing === "function") {
-        await space.typing();
-      } else if (typeof space.setTyping === "function") {
-        await space.setTyping(true);
-      }
-      return ok(res, {});
-    }
-    res.statusCode = 404;
-    res.setHeader("Content-Type", "application/json");
-    return res.end(JSON.stringify({ ok: false, error: "not found" }));
+    const space = await resolveSpace(spaceId);
+    const result = await space.send(spectrumText(text));
+    const messageId = (result && (result.id || result.messageId)) || null;
+    rememberSent(messageId);
+    emit({ type: "sent", cid, ok: true, messageId });
   } catch (e) {
-    console.error(
-      "photon-sidecar: handler error: " +
-        (e && e.stack ? e.stack : String(e))
-    );
-    // serverError() intentionally returns a generic message — see its
-    // body for the rationale.
-    return serverError(res);
+    log("send failed: " + (e && e.stack ? e.stack : String(e)));
+    emit({ type: "error", cid, ok: false, error: String((e && e.message) || e), code: "SEND_FAILED" });
+  }
+}
+
+async function handleTyping(cmd) {
+  const cid = cmd.cid ?? null;
+  const { spaceId } = cmd;
+  if (!spaceId) {
+    emit({ type: "error", cid, ok: false, error: "spaceId is required", code: "BAD_COMMAND" });
+    return;
+  }
+  try {
+    const space = await resolveSpace(spaceId);
+    if (typeof space.startTyping === "function") await space.startTyping();
+    else if (typeof space.typing === "function") await space.typing();
+    else if (typeof space.setTyping === "function") await space.setTyping(true);
+    emit({ type: "sent", cid, ok: true, messageId: null });
+  } catch (e) {
+    log("typing failed: " + (e && e.stack ? e.stack : String(e)));
+    emit({ type: "error", cid, ok: false, error: String((e && e.message) || e), code: "TYPING_FAILED" });
+  }
+}
+
+const rl = readline.createInterface({ input: process.stdin });
+
+rl.on("line", (line) => {
+  const trimmed = line.trim();
+  if (!trimmed) return;
+  let cmd;
+  try {
+    cmd = JSON.parse(trimmed);
+  } catch (e) {
+    log("ignoring non-JSON stdin line");
+    return;
+  }
+  switch (cmd && cmd.type) {
+    case "send":
+      handleSend(cmd);
+      break;
+    case "typing":
+      handleTyping(cmd);
+      break;
+    case "shutdown":
+      shutdown("shutdown-command");
+      break;
+    default:
+      emit({
+        type: "error",
+        cid: (cmd && cmd.cid) ?? null,
+        ok: false,
+        error: `unknown command type ${cmd && cmd.type}`,
+        code: "UNKNOWN_COMMAND",
+      });
   }
 });
 
-server.listen(port, bind, () => {
-  console.error(`photon-sidecar: listening on ${bind}:${port}`);
-});
+rl.on("close", () => shutdown("stdin-eof"));
 
-async function shutdown(signal) {
-  console.error(`photon-sidecar: received ${signal}, stopping...`);
+// ---------------------------------------------------------------------------
+// Shutdown
+
+let shuttingDown = false;
+
+async function shutdown(reason) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  log(`received ${reason}, stopping...`);
   try {
     await Promise.race([
       app.stop(),
       new Promise((resolve) => setTimeout(resolve, 3000)),
     ]);
   } catch (e) {
-    console.error("photon-sidecar: app.stop() failed: " + String(e));
+    log("app.stop() failed: " + String(e));
   }
-  server.close(() => process.exit(0));
-  setTimeout(() => process.exit(1), 500).unref();
+  process.exit(0);
 }
 
 process.on("SIGINT", () => shutdown("SIGINT"));
