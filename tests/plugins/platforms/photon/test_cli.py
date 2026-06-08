@@ -531,9 +531,12 @@ def test_primary_setup_reconciler_stays_inside_photon_boundary(
 def test_interactive_setup_runs_setup_without_existing_token_or_project(
     monkeypatch: Any,
 ) -> None:
+    import hermes_cli.cli_output as cli_output
+
     captured: list[argparse.Namespace] = []
 
     monkeypatch.setattr(photon_cli, "_interactive_setup_already_configured", lambda: False)
+    monkeypatch.setattr(cli_output, "prompt", lambda _question: PHONE)
 
     def fake_cmd_setup(args: argparse.Namespace) -> int:
         captured.append(args)
@@ -544,15 +547,62 @@ def test_interactive_setup_runs_setup_without_existing_token_or_project(
     photon_cli.interactive_setup()
 
     assert len(captured) == 1
-    assert captured[0].phone is None
+    assert captured[0].phone == PHONE
     assert captured[0].no_browser is False
+
+
+def test_interactive_setup_skips_when_phone_missing(
+    monkeypatch: Any,
+) -> None:
+    import hermes_cli.cli_output as cli_output
+
+    warnings: list[str] = []
+
+    monkeypatch.setattr(photon_cli, "_interactive_setup_already_configured", lambda: False)
+    monkeypatch.setattr(cli_output, "prompt", lambda _question: "")
+    monkeypatch.setattr(cli_output, "print_warning", lambda message: warnings.append(message))
+    monkeypatch.setattr(
+        photon_cli,
+        "_cmd_setup",
+        lambda _args: pytest.fail("missing phone must not start Photon setup"),
+    )
+
+    photon_cli.interactive_setup()
+
+    assert warnings == ["Phone number is required - skipping Photon setup."]
+
+
+def test_interactive_setup_skips_invalid_phone(
+    monkeypatch: Any,
+) -> None:
+    import hermes_cli.cli_output as cli_output
+
+    warnings: list[str] = []
+
+    monkeypatch.setattr(photon_cli, "_interactive_setup_already_configured", lambda: False)
+    monkeypatch.setattr(cli_output, "prompt", lambda _question: "555-1234")
+    monkeypatch.setattr(cli_output, "print_warning", lambda message: warnings.append(message))
+    monkeypatch.setattr(
+        photon_cli,
+        "_cmd_setup",
+        lambda _args: pytest.fail("invalid phone must not start Photon setup"),
+    )
+
+    photon_cli.interactive_setup()
+
+    assert warnings == [
+        "Phone number must be E.164, like '+<country-code><number>'."
+    ]
 
 
 def test_interactive_setup_failure_does_not_print_duplicate_guidance(
     monkeypatch: Any,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    import hermes_cli.cli_output as cli_output
+
     monkeypatch.setattr(photon_cli, "_interactive_setup_already_configured", lambda: False)
+    monkeypatch.setattr(cli_output, "prompt", lambda _question: PHONE)
 
     def fake_cmd_setup(_args: argparse.Namespace) -> int:
         print("Photon setup stopped: operator phone number is required")
@@ -688,6 +738,7 @@ def test_interactive_setup_decline_reconfigure_does_not_run_setup(
 def test_registered_platform_setup_fn_enters_interactive_setup(
     monkeypatch: Any,
 ) -> None:
+    import hermes_cli.cli_output as cli_output
     from plugins.platforms.photon import adapter as photon_adapter
 
     platforms: list[dict[str, Any]] = []
@@ -702,6 +753,7 @@ def test_registered_platform_setup_fn_enters_interactive_setup(
             commands.append(kwargs)
 
     monkeypatch.setattr(photon_cli, "_interactive_setup_already_configured", lambda: False)
+    monkeypatch.setattr(cli_output, "prompt", lambda _question: PHONE)
 
     def fake_cmd_setup(args: argparse.Namespace) -> int:
         captured.append(args)
@@ -721,7 +773,7 @@ def test_registered_platform_setup_fn_enters_interactive_setup(
     assert commands[0]["setup_fn"] is photon_cli.register_cli
     assert commands[0]["handler_fn"] is photon_cli.dispatch
     assert len(captured) == 1
-    assert captured[0].phone is None
+    assert captured[0].phone == PHONE
 
 
 @pytest.mark.parametrize(
@@ -845,6 +897,68 @@ def test_status_points_to_home_channel_when_missing(monkeypatch: Any) -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "adapter_runtime",
+    [
+        {},
+        {"health": {"healthy": False}},
+        {"health": {"healthy": False, "error": "not connected"}},
+    ],
+)
+def test_status_points_to_gateway_when_runtime_not_healthy(
+    monkeypatch: Any,
+    adapter_runtime: dict[str, Any],
+) -> None:
+    monkeypatch.setattr(photon_cli.photon_auth, "load_photon_token", lambda: "token")
+    monkeypatch.setattr(
+        photon_cli.photon_auth,
+        "load_project_credentials",
+        lambda: ("project-id", "secret"),
+    )
+    monkeypatch.setattr(
+        photon_cli,
+        "_get_env_value",
+        lambda key: f"any;-;{PHONE}" if key == "PHOTON_HOME_CHANNEL" else "",
+    )
+
+    assert (
+        photon_cli._next_status_step(
+            "✓ installed (spectrum-ts 1.17.1)",
+            adapter_runtime=adapter_runtime,
+        )
+        == "start or restart the Hermes gateway, then rerun `hermes photon status`"
+    )
+
+
+def test_status_points_to_imessage_when_runtime_healthy(
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setattr(photon_cli.photon_auth, "load_photon_token", lambda: "token")
+    monkeypatch.setattr(
+        photon_cli.photon_auth,
+        "load_project_credentials",
+        lambda: ("project-id", "secret"),
+    )
+    monkeypatch.setattr(
+        photon_cli.photon_auth,
+        "load_allowed_phone_numbers",
+        lambda: [PHONE],
+    )
+    monkeypatch.setattr(
+        photon_cli,
+        "_get_env_value",
+        lambda key: f"any;-;{PHONE}" if key == "PHOTON_HOME_CHANNEL" else "",
+    )
+
+    assert (
+        photon_cli._next_status_step(
+            "✓ installed (spectrum-ts 1.17.1)",
+            adapter_runtime={"health": {"healthy": True, "pid": 123}},
+        )
+        == "send an iMessage to the Photon number"
+    )
+
+
 def test_status_prints_home_channel_state(
     tmp_path: Path,
     monkeypatch: Any,
@@ -890,7 +1004,7 @@ def test_status_prints_home_channel_state(
     assert "next step           : send an iMessage to the Photon number" in out
 
 
-def test_setup_summary_omits_adapter_health(
+def test_setup_summary_waits_for_gateway_before_texting(
     tmp_path: Path,
     monkeypatch: Any,
     capsys: pytest.CaptureFixture[str],
@@ -899,10 +1013,22 @@ def test_setup_summary_omits_adapter_health(
     ctx.project_id = "project-id"
     ctx.operator_phone = PHONE
     ctx.assigned_phone_number = "+15550001111"
+    monkeypatch.setattr(photon_cli, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(photon_cli.photon_auth, "load_photon_token", lambda: "token")
+    monkeypatch.setattr(
+        photon_cli.photon_auth,
+        "load_project_credentials",
+        lambda: ("project-id", "secret"),
+    )
     monkeypatch.setattr(
         photon_cli,
         "_read_adapter_runtime_state",
-        lambda _home: {"health": {"healthy": True, "pid": 123}},
+        lambda _home: {},
+    )
+    monkeypatch.setattr(
+        photon_cli,
+        "_sidecar_dependency_status",
+        lambda: "✓ installed (spectrum-ts 1.17.1)",
     )
     monkeypatch.setattr(
         photon_cli,
@@ -917,8 +1043,58 @@ def test_setup_summary_omits_adapter_health(
 
     out = capsys.readouterr().out
     assert "Photon setup complete." in out
-    assert "adapter health" not in out
     assert "gateway lifecycle : managed by Hermes core" in out
+    assert "gateway status    : offline (Photon adapter not connected)" in out
+    assert "next step         : start or restart the Hermes gateway" in out
+    assert "Text Hermes:" not in out
+    assert "Send \"hi Hermes\"" not in out
+
+
+def test_setup_summary_shows_text_step_when_gateway_online(
+    tmp_path: Path,
+    monkeypatch: Any,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    ctx = _ctx(tmp_path)
+    ctx.project_id = "project-id"
+    ctx.operator_phone = PHONE
+    ctx.assigned_phone_number = "+15550001111"
+    monkeypatch.setattr(photon_cli, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(photon_cli.photon_auth, "load_photon_token", lambda: "token")
+    monkeypatch.setattr(
+        photon_cli.photon_auth,
+        "load_project_credentials",
+        lambda: ("project-id", "secret"),
+    )
+    monkeypatch.setattr(photon_cli.photon_auth, "load_allowed_phone_numbers", lambda: [PHONE])
+    monkeypatch.setattr(
+        photon_cli,
+        "_read_adapter_runtime_state",
+        lambda _home: {"health": {"healthy": True, "pid": 123}},
+    )
+    monkeypatch.setattr(
+        photon_cli,
+        "_sidecar_dependency_status",
+        lambda: "✓ installed (spectrum-ts 1.17.1)",
+    )
+    monkeypatch.setattr(
+        photon_cli,
+        "_get_env_value",
+        lambda key: {
+            "PHOTON_HOME_CHANNEL": f"any;-;{PHONE}",
+            "PHOTON_HOME_CHANNEL_NAME": "You (iMessage)",
+        }.get(key, ""),
+    )
+
+    photon_cli._print_setup_reconciled(ctx)
+
+    out = capsys.readouterr().out
+    assert "Photon setup complete." in out
+    assert "gateway lifecycle : managed by Hermes core" in out
+    assert "gateway status    : online (Photon adapter connected)" in out
+    assert "next step         : send an iMessage to the Photon number" in out
+    assert "Text Hermes:" in out
+    assert "Send \"hi Hermes\" to +15550001111" in out
 
 
 def test_photon_cli_does_not_import_gateway_lifecycle_internals() -> None:

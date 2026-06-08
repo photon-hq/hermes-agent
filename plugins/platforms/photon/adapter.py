@@ -20,6 +20,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import mimetypes
 import os
 import shutil
 import signal
@@ -60,6 +61,7 @@ _SIDECAR_DIR = Path(__file__).parent / "sidecar"
 
 _SIDECAR_READY_TIMEOUT_SECONDS = 20.0
 _SIDECAR_REQUEST_TIMEOUT_SECONDS = 30.0
+_SIDECAR_ATTACHMENT_TIMEOUT_SECONDS = 120.0
 _SIDECAR_SHUTDOWN_TIMEOUT_SECONDS = 3.0
 
 
@@ -749,6 +751,130 @@ class PhotonAdapter(BasePlatformAdapter):
             raw_response=data.get("raw") or data,
         )
 
+    async def _sidecar_send_attachment(
+        self,
+        *,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str] = None,
+        file_name: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        as_voice: bool = False,
+    ) -> SendResult:
+        try:
+            payload = _attachment_command_payload(
+                chat_id=chat_id,
+                file_path=file_path,
+                caption=caption,
+                file_name=file_name,
+                reply_to=reply_to,
+                as_voice=as_voice,
+            )
+        except ValueError as e:
+            return SendResult(success=False, error=str(e))
+
+        try:
+            data = await self._sdk_request(
+                "send_attachment",
+                payload,
+                timeout=_SIDECAR_ATTACHMENT_TIMEOUT_SECONDS,
+            )
+        except PhotonAdapterError as e:
+            return SendResult(success=False, error=str(e), retryable=e.retryable)
+        except Exception as e:
+            return SendResult(success=False, error=str(e), retryable=True)
+        self._last_send_at = _utc_now_iso()
+        self._write_adapter_runtime_state()
+        return SendResult(
+            success=True,
+            message_id=data.get("messageId") or data.get("captionMessageId"),
+            raw_response=data.get("raw") or data,
+        )
+
+    async def send_image(
+        self,
+        chat_id: str,
+        image_url: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,  # noqa: ARG002
+    ) -> SendResult:
+        try:
+            from gateway.platforms.base import cache_image_from_url
+
+            local_path = await cache_image_from_url(image_url)
+        except Exception:
+            return await super().send_image(chat_id, image_url, caption, reply_to)
+        return await self._sidecar_send_attachment(
+            chat_id=chat_id,
+            file_path=local_path,
+            caption=caption,
+            reply_to=reply_to,
+        )
+
+    async def send_image_file(
+        self,
+        chat_id: str,
+        image_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        **kwargs,
+    ) -> SendResult:
+        return await self._sidecar_send_attachment(
+            chat_id=chat_id,
+            file_path=image_path,
+            caption=caption,
+            reply_to=reply_to,
+        )
+
+    async def send_voice(
+        self,
+        chat_id: str,
+        audio_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        **kwargs,
+    ) -> SendResult:
+        return await self._sidecar_send_attachment(
+            chat_id=chat_id,
+            file_path=audio_path,
+            caption=caption,
+            reply_to=reply_to,
+            as_voice=True,
+        )
+
+    async def send_video(
+        self,
+        chat_id: str,
+        video_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        **kwargs,
+    ) -> SendResult:
+        return await self._sidecar_send_attachment(
+            chat_id=chat_id,
+            file_path=video_path,
+            caption=caption,
+            reply_to=reply_to,
+        )
+
+    async def send_document(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str] = None,
+        file_name: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        **kwargs,
+    ) -> SendResult:
+        return await self._sidecar_send_attachment(
+            chat_id=chat_id,
+            file_path=file_path,
+            caption=caption,
+            file_name=file_name,
+            reply_to=reply_to,
+        )
+
     async def send_typing(self, chat_id: str, metadata=None) -> None:  # noqa: ANN001, ARG002
         if not chat_id:
             return
@@ -917,6 +1043,63 @@ def _attachment_message_type(mime: str) -> MessageType:
     return MessageType.DOCUMENT
 
 
+def _guess_mime_type(file_path: str, file_name: Optional[str] = None) -> str:
+    candidates = [file_name, os.path.basename(file_path), file_path]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        guessed, _ = mimetypes.guess_type(str(candidate))
+        if guessed:
+            return guessed
+    return "application/octet-stream"
+
+
+def _attachment_command_payload(
+    *,
+    chat_id: str,
+    file_path: str,
+    caption: Optional[str] = None,
+    file_name: Optional[str] = None,
+    reply_to: Optional[str] = None,
+    as_voice: bool = False,
+) -> Dict[str, Any]:
+    if not isinstance(chat_id, str) or not chat_id.strip():
+        raise ValueError("Photon chat_id is required")
+    path = Path(str(file_path)).expanduser()
+    if not path.is_file():
+        raise ValueError(f"File not found: {file_path}")
+    name = (file_name or path.name or "attachment").strip()
+    payload: Dict[str, Any] = {
+        "spaceId": chat_id.strip(),
+        "filePath": str(path),
+        "fileName": name,
+        "mimeType": _guess_mime_type(str(path), name),
+        "asVoice": bool(as_voice),
+    }
+    if caption:
+        payload["caption"] = str(caption)
+    if reply_to:
+        payload["replyTo"] = str(reply_to)
+    return payload
+
+
+def _normalize_standalone_media(media_files: Optional[list]) -> list[tuple[str, bool]]:
+    normalized: list[tuple[str, bool]] = []
+    for item in media_files or []:
+        if isinstance(item, (list, tuple)) and item:
+            media_path = item[0]
+            is_voice = bool(item[1]) if len(item) > 1 else False
+        else:
+            media_path = item
+            is_voice = False
+        if media_path is None:
+            continue
+        path = str(media_path).strip()
+        if path:
+            normalized.append((path, is_voice))
+    return normalized
+
+
 # Standalone out-of-process delivery
 
 
@@ -931,13 +1114,13 @@ async def _standalone_send(
 ) -> Dict[str, Any]:
     """Send one Photon message without opening an inbound Spectrum stream."""
     _ = thread_id
-    if media_files:
-        return {"error": "Photon standalone send does not support media attachments yet"}
-    if force_document:
-        return {"error": "Photon standalone send does not support document attachments yet"}
+    _ = force_document
+    normalized_media = _normalize_standalone_media(media_files)
     if not isinstance(chat_id, str) or not chat_id.strip():
         return {"error": "Photon standalone send: chat_id is required"}
-    if not isinstance(message, str) or not message.strip():
+    if not isinstance(message, str):
+        return {"error": "Photon standalone send: text content must be a string"}
+    if not message.strip() and not normalized_media:
         return {"error": "Photon standalone send: text content is required"}
 
     project_id, project_secret = _configured_project_credentials(pconfig)
@@ -960,6 +1143,19 @@ async def _standalone_send(
             )
         }
 
+    attachment_payloads: list[Dict[str, Any]] = []
+    for media_path, is_voice in normalized_media:
+        try:
+            attachment_payloads.append(
+                _attachment_command_payload(
+                    chat_id=chat_id,
+                    file_path=media_path,
+                    as_voice=is_voice,
+                )
+            )
+        except ValueError as e:
+            return {"error": f"Photon standalone send: {e}"}
+
     text = message
     if len(text) > _MAX_MESSAGE_LENGTH:
         logger.warning(
@@ -976,6 +1172,7 @@ async def _standalone_send(
             project_secret=project_secret,
             chat_id=chat_id.strip(),
             text=text,
+            attachments=attachment_payloads,
         )
     except PhotonAdapterError as e:
         return {"error": f"Photon standalone send failed: {e}"}
@@ -996,6 +1193,7 @@ async def _send_once_via_sidecar(
     project_secret: str,
     chat_id: str,
     text: str,
+    attachments: Optional[list[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     env = _adapter_process_env(project_id=project_id, project_secret=project_secret)
     request_id = uuid.uuid4().hex
@@ -1015,11 +1213,31 @@ async def _send_once_via_sidecar(
         await _wait_for_send_once_ready(proc)
         if proc.stdin is None:
             raise AdapterUnavailableError("Photon send-once sidecar stdin unavailable")
-        body = {"requestId": request_id, "type": "send", "spaceId": chat_id, "text": text}
-        proc.stdin.write((json.dumps(body) + "\n").encode("utf-8"))
-        await proc.stdin.drain()
-        data = await _wait_for_send_once_response(proc, request_id)
-        return data
+        responses: list[Dict[str, Any]] = []
+        if text.strip():
+            body = {"requestId": request_id, "type": "send", "spaceId": chat_id, "text": text}
+            proc.stdin.write((json.dumps(body) + "\n").encode("utf-8"))
+            await proc.stdin.drain()
+            responses.append(await _wait_for_send_once_response(proc, request_id))
+        for attachment_payload in attachments or []:
+            attachment_request_id = uuid.uuid4().hex
+            body = {
+                "requestId": attachment_request_id,
+                "type": "send_attachment",
+                **attachment_payload,
+            }
+            proc.stdin.write((json.dumps(body) + "\n").encode("utf-8"))
+            await proc.stdin.drain()
+            responses.append(
+                await _wait_for_send_once_response(proc, attachment_request_id)
+            )
+        if not responses:
+            raise PermanentAdapterError("BAD_PAYLOAD", "nothing to send")
+        last = responses[-1]
+        return {
+            **last,
+            "results": responses,
+        }
     finally:
         if proc.stdin is not None and not proc.stdin.is_closing():
             proc.stdin.close()

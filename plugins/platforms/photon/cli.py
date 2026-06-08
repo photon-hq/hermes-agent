@@ -926,8 +926,8 @@ def _ensure_sidecar_ready(ctx: _PhotonSetupContext) -> None:
 def _report_gateway_handoff(ctx: _PhotonSetupContext) -> None:
     print("[gateway] Photon config saved; gateway lifecycle stays with Hermes core.")
     runtime = _read_adapter_runtime_state(ctx.hermes_home)
-    health = runtime.get("health") if isinstance(runtime, dict) else {}
-    if isinstance(health, dict) and health.get("healthy"):
+    health = _adapter_runtime_health(runtime)
+    if health.get("healthy"):
         pid = health.get("pid") or runtime.get("pid") or "-"
         print(f"  Photon adapter is already connected (pid {pid})")
     else:
@@ -1255,12 +1255,32 @@ def _print_setup_reconciled(ctx: _PhotonSetupContext) -> None:
     print(f"  home channel      : {home_channel}")
     print(f"  home channel name : {home_channel_name}")
     print("  gateway lifecycle : managed by Hermes core")
-    _print_text_photon_number_step(ctx)
+    adapter_runtime = _read_adapter_runtime_state(ctx.hermes_home)
+    sidecar_deps_status = _sidecar_dependency_status()
+    if _adapter_runtime_is_healthy(adapter_runtime):
+        print("  gateway status    : online (Photon adapter connected)")
+        print(
+            "  next step         : "
+            + _next_status_step(
+                sidecar_deps_status,
+                adapter_runtime=adapter_runtime,
+            )
+        )
+        _print_text_photon_number_step(ctx)
+    else:
+        print("  gateway status    : offline (Photon adapter not connected)")
+        print(
+            "  next step         : "
+            + _next_status_step(
+                sidecar_deps_status,
+                adapter_runtime=adapter_runtime,
+            )
+        )
 
 
 def interactive_setup() -> None:
     """Entry point used by `hermes setup gateway` when Photon is selected."""
-    from hermes_cli.cli_output import print_info, prompt_yes_no
+    from hermes_cli.cli_output import print_info, print_warning, prompt, prompt_yes_no
 
     setup_phone = None
     if _interactive_setup_already_configured():
@@ -1278,6 +1298,19 @@ def interactive_setup() -> None:
         setup_phone = (_get_env_value("PHOTON_OPERATOR_PHONE") or "").strip() or None
         if setup_phone:
             print_info(f"Reusing existing operator phone {setup_phone}.")
+
+    if not setup_phone:
+        setup_phone = prompt(
+            f"Your iMessage phone number (E.164, format {_PHONE_FORMAT})"
+        ).strip()
+        if not setup_phone:
+            print_warning("Phone number is required - skipping Photon setup.")
+            return
+        if not photon_auth.E164_RE.match(setup_phone):
+            print_warning(
+                f"Phone number must be E.164, like {_PHONE_ARG_PLACEHOLDER}."
+            )
+            return
 
     args = argparse.Namespace(
         phone=setup_phone,
@@ -1862,10 +1895,19 @@ def _read_adapter_runtime_state(hermes_home: Optional[Path] = None) -> dict[str,
     return data if isinstance(data, dict) else {}
 
 
+def _adapter_runtime_health(adapter_runtime: Optional[dict[str, Any]]) -> dict[str, Any]:
+    if not isinstance(adapter_runtime, dict):
+        return {}
+    health = adapter_runtime.get("health")
+    return health if isinstance(health, dict) else {}
+
+
+def _adapter_runtime_is_healthy(adapter_runtime: Optional[dict[str, Any]]) -> bool:
+    return bool(_adapter_runtime_health(adapter_runtime).get("healthy"))
+
+
 def _format_adapter_runtime_status(state: dict[str, Any]) -> str:
-    health = state.get("health") if isinstance(state, dict) else {}
-    if not isinstance(health, dict):
-        health = {}
+    health = _adapter_runtime_health(state)
     if health.get("healthy"):
         pid = health.get("pid") or state.get("pid") or "-"
         return f"✓ connected (pid {pid})"
@@ -2257,10 +2299,9 @@ def _next_status_step(
         )
     runtime_health = {}
     if isinstance(adapter_runtime, dict):
-        value = adapter_runtime.get("health")
-        runtime_health = value if isinstance(value, dict) else {}
+        runtime_health = _adapter_runtime_health(adapter_runtime)
     if not runtime_health.get("healthy"):
-        return "start or restart the Hermes gateway"
+        return "start or restart the Hermes gateway, then rerun `hermes photon status`"
     if not _photon_sender_access_configured():
         return f"hermes photon allow-phone {_PHONE_ARG_PLACEHOLDER}"
     return "send an iMessage to the Photon number"

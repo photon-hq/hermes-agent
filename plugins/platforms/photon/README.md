@@ -9,14 +9,24 @@ without exposing a local webhook or Cloudflare tunnel.
 Primary setup command:
 
 ```bash
+hermes gateway setup
+```
+
+Select `iMessage (via Photon)` from the messaging platform menu. The Photon
+setup step will ask for your real E.164 phone number. Do not put personal phone
+numbers in committed docs, examples, or bug reports.
+
+Advanced/direct setup command:
+
+```bash
 hermes photon setup '+<country-code><number>'
 ```
 
-Replace `+<country-code><number>` with your real E.164 phone number. Do not put
-personal phone numbers in committed docs, examples, or bug reports.
+Use the direct command when you want to reconcile Photon state without walking
+through the full gateway setup wizard.
 
-Setup always uses the fixed Photon dashboard project name `hermes-agent`. Users
-do not choose a project name on the primary setup path.
+Photon setup always uses the fixed Photon dashboard project name `hermes-agent`.
+Users do not choose a project name on the primary setup path.
 
 Setup reconciles:
 
@@ -33,8 +43,11 @@ The seeded home channel is `PHOTON_HOME_CHANNEL=any;-;+E164` and
 `PHOTON_HOME_CHANNEL_NAME=You (iMessage)`. Setup never overwrites an existing
 home channel, so custom proactive-delivery targets are preserved.
 
-After setup, start or restart the Hermes gateway so it can load the Photon
-adapter and subscribe to Spectrum events. Then check status:
+Setup configures Photon and saves Hermes gateway configuration. The Hermes
+gateway process is what brings the agent online: it loads the Photon adapter and
+subscribes to Spectrum events. After setup, start or restart the gateway when
+the setup wizard asks. `hermes photon status` shows whether the adapter is
+online; only text the Photon number when the next step says to send an iMessage.
 
 ```bash
 hermes photon status

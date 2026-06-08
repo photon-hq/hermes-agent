@@ -497,22 +497,20 @@ def test_runtime_state_is_current_home_adapter_status(
 
 
 @pytest.mark.parametrize(
-    ("cfg_extra", "chat_id", "message", "use_media", "expected_error"),
+    ("cfg_extra", "chat_id", "message", "expected_error"),
     [
-        ({}, "any;-;+15105550123", "hi", False, "PHOTON_PROJECT_ID"),
+        ({}, "any;-;+15105550123", "hi", "PHOTON_PROJECT_ID"),
         (
             {"project_id": "p", "project_secret": "s"},
             "",
             "hi",
-            False,
             "chat_id is required",
         ),
         (
             {"project_id": "p", "project_secret": "s"},
             "any;-;+15105550123",
-            "hi",
-            True,
-            "media attachments",
+            "",
+            "text content is required",
         ),
     ],
 )
@@ -522,27 +520,41 @@ def test_standalone_send_rejects_invalid_inputs(
     cfg_extra: dict[str, str],
     chat_id: str,
     message: str,
-    use_media: bool,
     expected_error: str,
 ) -> None:
     monkeypatch.delenv("PHOTON_PROJECT_ID", raising=False)
     monkeypatch.delenv("PHOTON_PROJECT_SECRET", raising=False)
     monkeypatch.setattr(photon_adapter, "load_project_credentials", lambda: (None, None))
 
-    kwargs: dict[str, Any] = {}
-    if use_media:
-        kwargs["media_files"] = [(str(tmp_path / "image.png"), False)]
-
     result = asyncio.run(
         photon_adapter._standalone_send(
             PlatformConfig(enabled=True, extra=cfg_extra),
             chat_id,
             message,
-            **kwargs,
         )
     )
 
     assert expected_error in result["error"]
+
+
+def test_standalone_send_rejects_missing_media_file(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    (tmp_path / "node_modules").mkdir()
+    monkeypatch.setattr(photon_adapter.shutil, "which", lambda _value: "/usr/bin/node")
+    monkeypatch.setattr(photon_adapter, "_SIDECAR_DIR", tmp_path)
+
+    result = asyncio.run(
+        photon_adapter._standalone_send(
+            PlatformConfig(enabled=True, extra={"project_id": "p", "project_secret": "s"}),
+            "any;-;+15105550123",
+            "",
+            media_files=[(str(tmp_path / "missing.png"), False)],
+        )
+    )
+
+    assert "File not found" in result["error"]
 
 
 def test_standalone_send_rejects_missing_sidecar_deps(
@@ -596,6 +608,47 @@ def test_standalone_send_maps_sidecar_success(
             "project_secret": "s",
             "chat_id": "any;-;+15105550123",
             "text": "hello",
+            "attachments": [],
+        }
+    ]
+
+
+def test_standalone_send_maps_media_files_to_sidecar(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    (tmp_path / "node_modules").mkdir()
+    image_path = tmp_path / "image.png"
+    image_path.write_bytes(b"png")
+    calls: list[dict[str, Any]] = []
+
+    monkeypatch.setattr(photon_adapter.shutil, "which", lambda _value: "/usr/bin/node")
+    monkeypatch.setattr(photon_adapter, "_SIDECAR_DIR", tmp_path)
+
+    async def fake_send_once(**kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs)
+        return {"messageId": "sent-media-1", "raw": {"id": "sent-media-1"}}
+
+    monkeypatch.setattr(photon_adapter, "_send_once_via_sidecar", fake_send_once)
+
+    result = asyncio.run(
+        photon_adapter._standalone_send(
+            PlatformConfig(enabled=True, extra={"project_id": "p", "project_secret": "s"}),
+            "any;-;+15105550123",
+            "",
+            media_files=[(str(image_path), False)],
+        )
+    )
+
+    assert result["success"] is True
+    assert calls[0]["text"] == ""
+    assert calls[0]["attachments"] == [
+        {
+            "spaceId": "any;-;+15105550123",
+            "filePath": str(image_path),
+            "fileName": "image.png",
+            "mimeType": "image/png",
+            "asVoice": False,
         }
     ]
 
@@ -628,11 +681,80 @@ def test_standalone_send_truncates_to_photon_limit(
     assert len(captured["text"]) == photon_adapter._MAX_MESSAGE_LENGTH
 
 
+def test_live_adapter_sends_document_attachment_via_sidecar(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    adapter = _make_adapter(monkeypatch, tmp_path)
+    doc_path = tmp_path / "report.pdf"
+    doc_path.write_bytes(b"%PDF")
+    calls: list[tuple[str, dict[str, Any], float]] = []
+
+    async def fake_sdk_request(command_type: str, payload: dict[str, Any], *, timeout: float):
+        calls.append((command_type, payload, timeout))
+        return {"messageId": "attachment-1", "raw": {"id": "attachment-1"}}
+
+    monkeypatch.setattr(adapter, "_sdk_request", fake_sdk_request)
+
+    result = asyncio.run(
+        adapter.send_document(
+            "any;-;+15105550123",
+            str(doc_path),
+            caption="here",
+            file_name="renamed.pdf",
+        )
+    )
+
+    assert result.success is True
+    assert result.message_id == "attachment-1"
+    assert calls == [
+        (
+            "send_attachment",
+            {
+                "spaceId": "any;-;+15105550123",
+                "filePath": str(doc_path),
+                "fileName": "renamed.pdf",
+                "mimeType": "application/pdf",
+                "asVoice": False,
+                "caption": "here",
+            },
+            photon_adapter._SIDECAR_ATTACHMENT_TIMEOUT_SECONDS,
+        )
+    ]
+
+
+def test_live_adapter_sends_voice_attachment_flag(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    adapter = _make_adapter(monkeypatch, tmp_path)
+    audio_path = tmp_path / "voice.m4a"
+    audio_path.write_bytes(b"audio")
+    captured: dict[str, Any] = {}
+
+    async def fake_sdk_request(command_type: str, payload: dict[str, Any], *, timeout: float):
+        captured.update({"command_type": command_type, "payload": payload, "timeout": timeout})
+        return {"messageId": "voice-1"}
+
+    monkeypatch.setattr(adapter, "_sdk_request", fake_sdk_request)
+
+    result = asyncio.run(
+        adapter.send_voice("any;-;+15105550123", str(audio_path))
+    )
+
+    assert result.success is True
+    assert captured["command_type"] == "send_attachment"
+    assert captured["payload"]["asVoice"] is True
+    assert captured["payload"]["mimeType"].startswith("audio/")
+
+
 def test_sidecar_send_once_mode_is_before_inbound_stream() -> None:
     source = (photon_adapter._SIDECAR_ENTRYPOINT).read_text()
 
     assert "sendOnceMode" in source
     assert "mode: \"send-once\"" in source
+    assert "send_attachment" in source
+    assert "spectrumAttachment" in source
     assert source.index("if (sendOnceMode)") < source.index(
         "for await (const [space, message] of app.messages)"
     )

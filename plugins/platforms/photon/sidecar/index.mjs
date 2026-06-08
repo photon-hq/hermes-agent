@@ -13,6 +13,7 @@
 //     {type:"fatal"|"stream_error", error:{code,message,retryable}}
 //   stdin JSON lines:
 //     {requestId, type:"send", spaceId, text, replyTo?}
+//     {requestId, type:"send_attachment", spaceId, filePath, fileName?, mimeType?, caption?, asVoice?}
 //     {requestId, type:"typing", spaceId}
 //     {requestId, type:"shutdown"}
 //
@@ -27,6 +28,7 @@
 //   node index.mjs --send-once
 //   stdin JSON lines:
 //     {requestId, type:"send", spaceId, text}
+//     {requestId, type:"send_attachment", spaceId, filePath, fileName?, mimeType?, caption?, asVoice?}
 //   The sidecar initializes Spectrum for outbound delivery only and does not
 //   consume app.messages.
 
@@ -582,8 +584,15 @@ if (managementMode) {
 let Spectrum;
 let imessage;
 let spectrumText;
+let spectrumAttachment;
+let spectrumVoice;
 try {
-  ({ Spectrum, text: spectrumText } = await import("spectrum-ts"));
+  ({
+    Spectrum,
+    attachment: spectrumAttachment,
+    text: spectrumText,
+    voice: spectrumVoice,
+  } = await import("spectrum-ts"));
   ({ imessage } = await import("spectrum-ts/providers/imessage"));
 } catch (error) {
   emit({
@@ -701,6 +710,77 @@ async function handleCommand(command) {
         ok: true,
         data: {
           messageId,
+          raw: plain(result),
+        },
+      });
+      return;
+    }
+
+    if (type === "send_attachment") {
+      const spaceId = command.spaceId;
+      const filePath = command.filePath;
+      if (!spaceId || typeof filePath !== "string" || !filePath.trim()) {
+        throw Object.assign(new Error("spaceId and filePath are required"), {
+          code: "BAD_PAYLOAD",
+          retryable: false,
+        });
+      }
+      const space = await resolveSpace(spaceId);
+      if (command.replyTo) {
+        emit({
+          type: "log",
+          level: "debug",
+          message:
+            "replyTo is not supported by spectrum-ts send yet; sending a plain attachment",
+        });
+      }
+      const options = {};
+      const fileName = firstString(command.fileName);
+      const mimeType = firstString(command.mimeType);
+      if (fileName) {
+        options.name = fileName;
+      }
+      if (mimeType) {
+        options.mimeType = mimeType;
+      }
+      let result;
+      let sentAsVoice = false;
+      if (command.asVoice) {
+        try {
+          result = await space.send(spectrumVoice(filePath, options));
+          sentAsVoice = true;
+        } catch (error) {
+          emit({
+            type: "log",
+            level: "info",
+            message: `voice attachment send failed, retrying as a regular attachment: ${
+              error && error.message ? error.message : String(error)
+            }`,
+          });
+          result = await space.send(spectrumAttachment(filePath, options));
+        }
+      } else {
+        result = await space.send(spectrumAttachment(filePath, options));
+      }
+      const messageId = result?.id || result?.messageId || null;
+      rememberSentMessageId(messageId);
+
+      let captionMessageId = null;
+      const caption = firstString(command.caption);
+      if (caption) {
+        const captionResult = await space.send(spectrumText(caption));
+        captionMessageId = captionResult?.id || captionResult?.messageId || null;
+        rememberSentMessageId(captionMessageId);
+      }
+
+      emit({
+        type: "response",
+        requestId,
+        ok: true,
+        data: {
+          messageId,
+          captionMessageId,
+          sentAsVoice,
           raw: plain(result),
         },
       });
