@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from typing import Any
 
@@ -205,6 +206,14 @@ def test_send_builds_sdk_payload_and_maps_success(
             False,
             "bad payload",
         ),
+        (
+            photon_adapter.NonRetryableAdapterError(
+                "SDK_REQUEST_TIMEOUT",
+                "Photon adapter command send timed out",
+            ),
+            False,
+            "Photon adapter command send timed out",
+        ),
     ],
 )
 def test_send_maps_adapter_errors(
@@ -313,6 +322,130 @@ def test_connect_releases_lock_after_startup_failure(
     assert asyncio.run(adapter.connect()) is False
     assert released == [True]
     assert adapter._adapter_state == "fatal"
+
+
+def test_sdk_request_serializes_sidecar_commands(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    adapter = _make_adapter(monkeypatch, tmp_path)
+    events: list[str] = []
+
+    class FakeStdin:
+        def __init__(self) -> None:
+            self.last: bytes = b""
+
+        def write(self, data: bytes) -> None:
+            self.last = data
+            body = json.loads(data.decode("utf-8"))
+            events.append(f"write:{body['text']}")
+
+        async def drain(self) -> None:
+            body = json.loads(self.last.decode("utf-8"))
+            text = body["text"]
+            if text == "one":
+                await asyncio.sleep(0.02)
+            adapter._resolve_sidecar_response(
+                {
+                    "type": "response",
+                    "requestId": body["requestId"],
+                    "ok": True,
+                    "data": {"messageId": text},
+                }
+            )
+            events.append(f"respond:{text}")
+
+    class FakeProc:
+        returncode = None
+        pid = 12345
+
+        def __init__(self) -> None:
+            self.stdin = FakeStdin()
+
+    adapter._sidecar_proc = FakeProc()  # type: ignore[assignment]
+
+    async def run() -> list[dict[str, Any]]:
+        return await asyncio.gather(
+            adapter._sdk_request("send", {"spaceId": "s", "text": "one"}, timeout=1.0),
+            adapter._sdk_request("send", {"spaceId": "s", "text": "two"}, timeout=1.0),
+        )
+
+    results = asyncio.run(run())
+
+    assert [result["messageId"] for result in results] == ["one", "two"]
+    assert events.index("respond:one") < events.index("write:two")
+
+
+def test_sdk_request_recycles_sidecar_after_send_timeout(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    adapter = _make_adapter(monkeypatch, tmp_path)
+    restarted: list[str] = []
+
+    class HangingStdin:
+        def write(self, _data: bytes) -> None:
+            return None
+
+        async def drain(self) -> None:
+            return None
+
+    class FakeProc:
+        returncode = None
+        pid = 12345
+        stdin = HangingStdin()
+
+    async def fake_restart(command_type: str) -> None:
+        restarted.append(command_type)
+
+    adapter._sidecar_proc = FakeProc()  # type: ignore[assignment]
+    monkeypatch.setattr(adapter, "_restart_sdk_sidecar_after_timeout", fake_restart)
+
+    with pytest.raises(photon_adapter.NonRetryableAdapterError) as excinfo:
+        asyncio.run(
+            adapter._sdk_request(
+                "send",
+                {"spaceId": "s", "text": "hi"},
+                timeout=0.01,
+            )
+        )
+
+    assert "send timed out" in str(excinfo.value)
+    assert excinfo.value.retryable is False
+    assert restarted == ["send"]
+    assert adapter._pending_requests == {}
+
+
+def test_sdk_request_does_not_recycle_sidecar_after_typing_timeout(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    adapter = _make_adapter(monkeypatch, tmp_path)
+    restarted: list[str] = []
+
+    class HangingStdin:
+        def write(self, _data: bytes) -> None:
+            return None
+
+        async def drain(self) -> None:
+            return None
+
+    class FakeProc:
+        returncode = None
+        pid = 12345
+        stdin = HangingStdin()
+
+    async def fake_restart(command_type: str) -> None:
+        restarted.append(command_type)
+
+    adapter._sidecar_proc = FakeProc()  # type: ignore[assignment]
+    monkeypatch.setattr(adapter, "_restart_sdk_sidecar_after_timeout", fake_restart)
+
+    with pytest.raises(photon_adapter.RetryableAdapterError):
+        asyncio.run(adapter._sdk_request("typing", {"spaceId": "s"}, timeout=0.01))
+
+    assert restarted == []
+    assert adapter._pending_requests == {}
 
 
 def test_disconnect_releases_project_lock(
@@ -542,6 +675,7 @@ def test_standalone_send_rejects_missing_media_file(
     monkeypatch: Any,
 ) -> None:
     (tmp_path / "node_modules").mkdir()
+    monkeypatch.setattr(photon_adapter, "load_project_credentials", lambda: (None, None))
     monkeypatch.setattr(photon_adapter.shutil, "which", lambda _value: "/usr/bin/node")
     monkeypatch.setattr(photon_adapter, "_SIDECAR_DIR", tmp_path)
 
@@ -561,6 +695,7 @@ def test_standalone_send_rejects_missing_sidecar_deps(
     tmp_path: Path,
     monkeypatch: Any,
 ) -> None:
+    monkeypatch.setattr(photon_adapter, "load_project_credentials", lambda: (None, None))
     monkeypatch.setattr(photon_adapter.shutil, "which", lambda _value: "/usr/bin/node")
     monkeypatch.setattr(photon_adapter, "_SIDECAR_DIR", tmp_path)
 
@@ -582,6 +717,7 @@ def test_standalone_send_maps_sidecar_success(
     (tmp_path / "node_modules").mkdir()
     calls: list[dict[str, Any]] = []
 
+    monkeypatch.setattr(photon_adapter, "load_project_credentials", lambda: (None, None))
     monkeypatch.setattr(photon_adapter.shutil, "which", lambda _value: "/usr/bin/node")
     monkeypatch.setattr(photon_adapter, "_SIDECAR_DIR", tmp_path)
 
@@ -622,6 +758,7 @@ def test_standalone_send_maps_media_files_to_sidecar(
     image_path.write_bytes(b"png")
     calls: list[dict[str, Any]] = []
 
+    monkeypatch.setattr(photon_adapter, "load_project_credentials", lambda: (None, None))
     monkeypatch.setattr(photon_adapter.shutil, "which", lambda _value: "/usr/bin/node")
     monkeypatch.setattr(photon_adapter, "_SIDECAR_DIR", tmp_path)
 
@@ -660,6 +797,7 @@ def test_standalone_send_truncates_to_photon_limit(
     (tmp_path / "node_modules").mkdir()
     captured: dict[str, Any] = {}
 
+    monkeypatch.setattr(photon_adapter, "load_project_credentials", lambda: (None, None))
     monkeypatch.setattr(photon_adapter.shutil, "which", lambda _value: "/usr/bin/node")
     monkeypatch.setattr(photon_adapter, "_SIDECAR_DIR", tmp_path)
 
@@ -723,6 +861,47 @@ def test_live_adapter_sends_document_attachment_via_sidecar(
     ]
 
 
+def test_live_adapter_sends_image_file_attachment_via_sidecar(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    adapter = _make_adapter(monkeypatch, tmp_path)
+    image_path = tmp_path / "photo.jpeg"
+    image_path.write_bytes(b"jpeg")
+    calls: list[tuple[str, dict[str, Any], float]] = []
+
+    async def fake_sdk_request(command_type: str, payload: dict[str, Any], *, timeout: float):
+        calls.append((command_type, payload, timeout))
+        return {"messageId": "image-1", "raw": {"id": "image-1"}}
+
+    monkeypatch.setattr(adapter, "_sdk_request", fake_sdk_request)
+
+    result = asyncio.run(
+        adapter.send_image_file(
+            "any;-;+15105550123",
+            str(image_path),
+            caption="photo",
+        )
+    )
+
+    assert result.success is True
+    assert result.message_id == "image-1"
+    assert calls == [
+        (
+            "send_attachment",
+            {
+                "spaceId": "any;-;+15105550123",
+                "filePath": str(image_path),
+                "fileName": "photo.jpeg",
+                "mimeType": "image/jpeg",
+                "asVoice": False,
+                "caption": "photo",
+            },
+            photon_adapter._SIDECAR_ATTACHMENT_TIMEOUT_SECONDS,
+        )
+    ]
+
+
 def test_live_adapter_sends_voice_attachment_flag(
     tmp_path: Path,
     monkeypatch: Any,
@@ -748,6 +927,100 @@ def test_live_adapter_sends_voice_attachment_flag(
     assert captured["payload"]["mimeType"].startswith("audio/")
 
 
+def test_live_adapter_send_media_directive_routes_to_attachment_without_text(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    adapter = _make_adapter(monkeypatch, tmp_path)
+    image_path = tmp_path / "cat.jpg"
+    image_path.write_bytes(b"jpeg")
+    calls: list[tuple[str, dict[str, Any], Optional[float]]] = []
+
+    async def fake_sdk_request(
+        command_type: str,
+        payload: dict[str, Any],
+        *,
+        timeout: Optional[float] = None,
+    ):
+        calls.append((command_type, payload, timeout))
+        return {"messageId": f"{command_type}-1"}
+
+    monkeypatch.setattr(adapter, "_sdk_request", fake_sdk_request)
+
+    result = asyncio.run(
+        adapter.send("any;-;+15105550123", f"MEDIA:{image_path}")
+    )
+
+    assert result.success is True
+    assert result.message_id == "send_attachment-1"
+    assert [call[0] for call in calls] == ["send_attachment"]
+    assert calls[0][1]["filePath"] == str(image_path)
+    assert calls[0][1]["mimeType"] == "image/jpeg"
+
+
+def test_live_adapter_send_heic_media_directive_routes_to_attachment(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    adapter = _make_adapter(monkeypatch, tmp_path)
+    image_path = tmp_path / "photo.heic"
+    image_path.write_bytes(b"heic")
+    calls: list[tuple[str, dict[str, Any], Optional[float]]] = []
+
+    async def fake_sdk_request(
+        command_type: str,
+        payload: dict[str, Any],
+        *,
+        timeout: Optional[float] = None,
+    ):
+        calls.append((command_type, payload, timeout))
+        return {"messageId": f"{command_type}-1"}
+
+    monkeypatch.setattr(adapter, "_sdk_request", fake_sdk_request)
+
+    result = asyncio.run(
+        adapter.send("any;-;+15105550123", f"MEDIA:{image_path}")
+    )
+
+    assert result.success is True
+    assert [call[0] for call in calls] == ["send_attachment"]
+    assert calls[0][1]["filePath"] == str(image_path)
+
+
+def test_live_adapter_send_media_directive_strips_visible_media_text(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    adapter = _make_adapter(monkeypatch, tmp_path)
+    image_path = tmp_path / "cat.jpg"
+    image_path.write_bytes(b"jpeg")
+    calls: list[tuple[str, dict[str, Any], Optional[float]]] = []
+
+    async def fake_sdk_request(
+        command_type: str,
+        payload: dict[str, Any],
+        *,
+        timeout: Optional[float] = None,
+    ):
+        calls.append((command_type, payload, timeout))
+        return {"messageId": f"{command_type}-{len(calls)}"}
+
+    monkeypatch.setattr(adapter, "_sdk_request", fake_sdk_request)
+
+    result = asyncio.run(
+        adapter.send("any;-;+15105550123", f"Here is the cat.\nMEDIA:{image_path}")
+    )
+
+    assert result.success is True
+    assert [call[0] for call in calls] == ["send", "send_attachment"]
+    assert calls[0][1] == {
+        "spaceId": "any;-;+15105550123",
+        "text": "Here is the cat.",
+    }
+    assert calls[1][1]["filePath"] == str(image_path)
+    assert calls[1][1]["mimeType"] == "image/jpeg"
+
+
 def test_sidecar_send_once_mode_is_before_inbound_stream() -> None:
     source = (photon_adapter._SIDECAR_ENTRYPOINT).read_text()
 
@@ -755,6 +1028,9 @@ def test_sidecar_send_once_mode_is_before_inbound_stream() -> None:
     assert "mode: \"send-once\"" in source
     assert "send_attachment" in source
     assert "spectrumAttachment" in source
+    assert "options: { flattenGroups: true }" in source
+    assert "commandQueue" in source
+    assert "enqueueCommand(command)" in source
     assert source.index("if (sendOnceMode)") < source.index(
         "for await (const [space, message] of app.messages)"
     )

@@ -769,6 +769,10 @@ def test_registered_platform_setup_fn_enters_interactive_setup(
     assert platforms[0]["setup_fn"] is photon_cli.interactive_setup
     assert platforms[0]["cron_deliver_env_var"] == "PHOTON_HOME_CHANNEL"
     assert callable(platforms[0]["standalone_sender_fn"])
+    assert "You CAN send media files natively" in platforms[0]["platform_hint"]
+    assert "MEDIA:/absolute/path/to/file" in platforms[0]["platform_hint"]
+    assert "Do NOT tell the user Photon lacks file-sending capability" in platforms[0]["platform_hint"]
+    assert "do NOT use the send_message tool for media" in platforms[0]["platform_hint"]
     assert commands[0]["name"] == "photon"
     assert commands[0]["setup_fn"] is photon_cli.register_cli
     assert commands[0]["handler_fn"] is photon_cli.dispatch

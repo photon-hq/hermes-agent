@@ -32,6 +32,9 @@
 //   The sidecar initializes Spectrum for outbound delivery only and does not
 //   consume app.messages.
 
+import { randomUUID } from "node:crypto";
+import { mkdir, writeFile } from "node:fs/promises";
+import { basename, extname, join } from "node:path";
 import readline from "node:readline";
 
 const projectId = process.env.PHOTON_PROJECT_ID;
@@ -44,6 +47,27 @@ const sendOnceMode =
   process.env.PHOTON_SIDECAR_MODE === "send-once";
 const E164_RE = /^\+[1-9]\d{6,14}$/;
 const SENT_ECHO_TTL_MS = 5 * 60 * 1000;
+const DEFAULT_MAX_INBOUND_ATTACHMENT_BYTES = 50 * 1024 * 1024;
+const MIME_EXTENSIONS = {
+  "application/pdf": ".pdf",
+  "application/zip": ".zip",
+  "audio/aac": ".aac",
+  "audio/mp4": ".m4a",
+  "audio/mp4a-latm": ".m4a",
+  "audio/mpeg": ".mp3",
+  "audio/ogg": ".ogg",
+  "audio/wav": ".wav",
+  "audio/x-m4a": ".m4a",
+  "image/gif": ".gif",
+  "image/heic": ".heic",
+  "image/jpeg": ".jpg",
+  "image/png": ".png",
+  "image/webp": ".webp",
+  "text/plain": ".txt",
+  "video/mp4": ".mp4",
+  "video/quicktime": ".mov",
+  "video/webm": ".webm",
+};
 
 function emit(payload) {
   process.stdout.write(JSON.stringify(payload) + "\n");
@@ -134,6 +158,106 @@ function firstString(...values) {
     }
   }
   return "";
+}
+
+function maxInboundAttachmentBytes() {
+  const raw = Number(process.env.PHOTON_MAX_INBOUND_ATTACHMENT_BYTES || "");
+  if (Number.isFinite(raw) && raw > 0) {
+    return raw;
+  }
+  return DEFAULT_MAX_INBOUND_ATTACHMENT_BYTES;
+}
+
+function extensionForAttachment(name, mimeType, type) {
+  const fromName = extname(name || "");
+  if (fromName) {
+    return fromName;
+  }
+  const normalizedMime = String(mimeType || "").toLowerCase();
+  if (MIME_EXTENSIONS[normalizedMime]) {
+    return MIME_EXTENSIONS[normalizedMime];
+  }
+  if (normalizedMime.startsWith("image/")) {
+    return ".img";
+  }
+  if (normalizedMime.startsWith("audio/") || type === "voice") {
+    return ".audio";
+  }
+  if (normalizedMime.startsWith("video/")) {
+    return ".video";
+  }
+  return ".bin";
+}
+
+function cacheSubdirForAttachment(mimeType, type) {
+  const normalizedMime = String(mimeType || "").toLowerCase();
+  if (normalizedMime.startsWith("image/")) {
+    return "images";
+  }
+  if (normalizedMime.startsWith("audio/") || type === "voice") {
+    return "audio";
+  }
+  if (normalizedMime.startsWith("video/")) {
+    return "videos";
+  }
+  return "documents";
+}
+
+function safeAttachmentName(name, ext) {
+  const fallback = `attachment${ext || ".bin"}`;
+  const base = basename(name || fallback).replace(/[\x00-\x1f]/g, "").trim();
+  let cleaned = base.replace(/[^\w.\- ]/g, "_");
+  if (!cleaned || cleaned === "." || cleaned === "..") {
+    return fallback;
+  }
+  if (!extname(cleaned) && ext) {
+    cleaned = `${cleaned}${ext}`;
+  }
+  return cleaned;
+}
+
+function bufferFromReadResult(value) {
+  if (Buffer.isBuffer(value)) {
+    return value;
+  }
+  if (value instanceof ArrayBuffer) {
+    return Buffer.from(value);
+  }
+  if (ArrayBuffer.isView(value)) {
+    return Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+  }
+  return Buffer.from(value);
+}
+
+async function cacheInboundAttachment(content, { type, name, mimeType }) {
+  if (typeof content?.read !== "function") {
+    return {};
+  }
+  const maxBytes = maxInboundAttachmentBytes();
+  if (typeof content.size === "number" && content.size > maxBytes) {
+    return {
+      cacheError: `attachment exceeds PHOTON_MAX_INBOUND_ATTACHMENT_BYTES (${content.size} > ${maxBytes})`,
+    };
+  }
+  const bytes = bufferFromReadResult(await content.read());
+  if (bytes.byteLength > maxBytes) {
+    return {
+      cacheError: `attachment exceeds PHOTON_MAX_INBOUND_ATTACHMENT_BYTES (${bytes.byteLength} > ${maxBytes})`,
+    };
+  }
+
+  const ext = extensionForAttachment(name, mimeType, type);
+  const safeName = safeAttachmentName(name, ext);
+  const hermesHome = process.env.HERMES_HOME || process.cwd();
+  const cacheDir = join(
+    hermesHome,
+    "cache",
+    cacheSubdirForAttachment(mimeType, type),
+  );
+  await mkdir(cacheDir, { recursive: true });
+  const localPath = join(cacheDir, `photon_${randomUUID().slice(0, 12)}_${safeName}`);
+  await writeFile(localPath, bytes);
+  return { localPath, size: bytes.byteLength };
 }
 
 function normalizePhoneUser(user) {
@@ -427,7 +551,7 @@ async function runManagementSidecar() {
   }
 }
 
-function normalizeContent(message) {
+async function normalizeContent(message) {
   const directText = firstString(message?.text, message?.body, message?.message);
   const content = message?.content;
   if (directText) {
@@ -444,6 +568,34 @@ function normalizeContent(message) {
         text: firstString(content.text, content.body, content.value),
       };
     }
+    if (type === "group") {
+      const items = Array.isArray(content.items) ? content.items : [];
+      const normalizedItems = [];
+      for (const item of items) {
+        normalizedItems.push(await normalizeContent(item));
+      }
+      return {
+        type: "group",
+        text: normalizedItems
+          .map((item) => firstString(item.text, item.name))
+          .filter(Boolean)
+          .join("\n"),
+        items: normalizedItems,
+        raw: plain(content),
+      };
+    }
+    const name = firstString(content.name, content.filename);
+    const mimeType = firstString(content.mimeType, content.mime, content.contentType);
+    let cached = {};
+    if (type === "attachment" || type === "voice") {
+      try {
+        cached = await cacheInboundAttachment(content, { type, name, mimeType });
+      } catch (error) {
+        cached = {
+          cacheError: error && error.message ? error.message : String(error),
+        };
+      }
+    }
     return {
       type,
       text: firstString(
@@ -452,8 +604,11 @@ function normalizeContent(message) {
         content.name,
         content.filename,
       ),
-      name: firstString(content.name, content.filename),
-      mimeType: firstString(content.mimeType, content.mime, content.contentType),
+      id: firstString(content.id, content.guid),
+      name,
+      mimeType,
+      size: typeof content.size === "number" ? content.size : cached.size,
+      ...cached,
       raw: plain(content),
     };
   }
@@ -505,7 +660,7 @@ function normalizeSender(message) {
   };
 }
 
-function normalizeEvent(space, message) {
+async function normalizeEvent(space, message) {
   return {
     id: firstString(message?.id, message?.messageId, message?.uuid),
     platform: firstString(message?.platform, "imessage"),
@@ -516,7 +671,7 @@ function normalizeEvent(space, message) {
     ),
     space: normalizeSpace(space, message),
     sender: normalizeSender(message),
-    content: normalizeContent(message),
+    content: await normalizeContent(message),
     raw: plain(message),
   };
 }
@@ -614,6 +769,7 @@ try {
     projectId,
     projectSecret,
     providers: [imessage.config()],
+    options: { flattenGroups: true },
   });
 } catch (error) {
   emit({ type: "fatal", error: errorPayload(error) });
@@ -859,11 +1015,24 @@ if (sendOnceMode) {
   process.exit(0);
 }
 
+let commandQueue = Promise.resolve();
+
+function enqueueCommand(command) {
+  commandQueue = commandQueue
+    .then(() => handleCommand(command))
+    .catch((error) => {
+      emit({
+        type: "error",
+        error: errorPayload(error),
+      });
+    });
+}
+
 (async () => {
   try {
     for await (const [space, message] of app.messages) {
       cacheSpace(space);
-      const event = normalizeEvent(space, message);
+      const event = await normalizeEvent(space, message);
       if (shouldSuppressSelfEcho(message, event)) {
         emit({
           type: "log",
@@ -904,9 +1073,9 @@ rl.on("line", (line) => {
       },
     });
     return;
-  }
-  void handleCommand(command);
-});
+    }
+    enqueueCommand(command);
+  });
 
 emit({
   type: "ready",

@@ -38,15 +38,17 @@ The sidecar owns only the Node/Spectrum side:
 - creates the Spectrum app with `PHOTON_PROJECT_ID` and
   `PHOTON_PROJECT_SECRET`
 - reads inbound messages from `app.messages`
-- normalizes low-level SDK message payloads before sending them to Python
-- resolves Spectrum spaces and calls `space.send(...)` for outbound text
+- normalizes low-level SDK message payloads before sending them to Python,
+  including caching inbound attachment bytes from SDK `read()` accessors
+- resolves Spectrum spaces and calls `space.send(...)` for outbound text and
+  attachments
 - emits SDK errors in the local sidecar protocol shape
 
 Send-once mode (`node index.mjs --send-once` or
 `PHOTON_SIDECAR_MODE=send-once`) initializes Spectrum, accepts one `send`
-command on stdin, emits one structured response, and exits. It does not iterate
-`app.messages`, so cron/proactive delivery does not open a second inbound
-stream.
+or `send_attachment` command on stdin, emits one structured response, and exits.
+It does not iterate `app.messages`, so cron/proactive delivery does not open a
+second inbound stream.
 
 There are no Hermes-managed Photon webhooks, Cloudflare tunnels, public health
 checks, or local HTTP endpoints in the primary Photon runtime path.
@@ -74,6 +76,7 @@ over the sidecar process stdin/stdout pipes. This is private local IPC, not HTTP
 
 ```json
 {"requestId":"...","type":"send","spaceId":"...","text":"..."}
+{"requestId":"...","type":"send_attachment","spaceId":"...","filePath":"...","fileName":"...","mimeType":"image/png","asVoice":false}
 {"requestId":"...","type":"typing","spaceId":"..."}
 {"requestId":"...","type":"shutdown"}
 ```
@@ -82,7 +85,7 @@ The sidecar emits messages on stdout:
 
 ```json
 {"type":"ready","pid":12345,"startedAt":"...","protocolVersion":1}
-{"type":"event","event":{"id":"...","space":{"id":"..."},"content":{"type":"text","text":"..."}}}
+{"type":"event","event":{"id":"...","space":{"id":"..."},"content":{"type":"attachment","name":"photo.jpg","mimeType":"image/jpeg","localPath":"/.../cache/images/photon_..."}}}
 {"type":"response","requestId":"...","ok":true,"data":{"messageId":"..."}}
 {"type":"response","requestId":"...","ok":false,"error":{"code":"...","message":"...","retryable":true}}
 {"type":"stream_error","error":{"code":"...","message":"...","retryable":true}}
@@ -99,7 +102,7 @@ Inbound delivery comes from the Spectrum app message stream:
 
 ```js
 for await (const [space, message] of app.messages) {
-  // normalize and emit to adapter.py
+  // normalize, cache attachment bytes when present, and emit to adapter.py
 }
 ```
 
@@ -107,6 +110,13 @@ Outbound delivery resolves a Spectrum space and sends SDK text content:
 
 ```js
 const result = await space.send(spectrumText(messageText));
+```
+
+Outbound media uses the SDK content builders:
+
+```js
+await space.send(attachment(filePath, { name, mimeType }));
+await space.send(voice(audioPath, { name, mimeType }));
 ```
 
 Management mode also uses authenticated Spectrum project-user API calls for

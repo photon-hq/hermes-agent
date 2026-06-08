@@ -68,6 +68,14 @@ After setup, start or restart the Hermes gateway. The gateway loads
 `plugins/platforms/photon/adapter.py`, and the adapter starts the private SDK
 sidecar and subscribes to inbound Spectrum events.
 
+Outbound media is supported through the same `MEDIA:/path/to/file` mechanism as
+other Hermes messaging platforms. Photon sends images, audio/voice files,
+videos, and documents through Spectrum attachment content. Inbound attachments
+are read from Spectrum's SDK content accessors, cached under the current Hermes
+home, and routed through the normal image, audio, video, and document pipelines.
+If the SDK cannot materialize the bytes, Hermes still shows a metadata marker
+with the filename and MIME type.
+
 Only one Hermes gateway process can stream a given Photon Spectrum project at a
 time. If Photon status reports that the project is already in use, stop the
 other gateway first, then start this gateway again. Send-once delivery for

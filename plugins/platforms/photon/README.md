@@ -104,6 +104,19 @@ The Spectrum SDK currently runs in Node, so `adapter.py` starts a private sideca
 process over stdio. The sidecar is an implementation detail; it does not expose
 HTTP endpoints.
 
+## Media
+
+Outbound `MEDIA:/path/to/file` delivery works through the Photon sidecar. The
+adapter routes `send_image_file`, `send_voice`, `send_video`, and
+`send_document` to Spectrum `attachment(...)` / `voice(...)` content, both from
+the live gateway adapter and the send-once path used by cron/proactive delivery.
+
+Inbound attachments are read from Spectrum's in-process SDK content accessors
+and cached under the current Hermes home, then surfaced as `MessageEvent`
+`media_urls` / `media_types` for the normal image, audio, video, and document
+pipelines. If Spectrum cannot materialize the bytes, Hermes still includes a
+metadata marker with the filename and MIME type.
+
 The adapter writes runtime state to:
 
 ```text
