@@ -10,9 +10,10 @@ import pytest
 
 from gateway.config import PlatformConfig
 from gateway.config import GatewayConfig, HomeChannel, Platform, _apply_env_overrides
-from gateway.platforms.base import SendResult
+from gateway.platforms.base import MessageEvent, MessageType, SendResult
 from gateway.platforms import weixin
 from gateway.platforms.weixin import ContextTokenStore, WeixinAdapter
+from gateway.session import build_session_key
 from tools.send_message_tool import _parse_target_ref, _send_to_platform
 
 
@@ -437,6 +438,101 @@ class TestWeixinQuoteReplies:
             **inbound_item,
             "msg_id": "9001",
         }
+
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_response_quotes_item_matching_extracted_text(self, send_message_mock):
+        adapter = _make_adapter()
+        adapter._poll_session = object()
+        adapter._send_session = object()
+        adapter._token = "test-token"
+        adapter._token_store.get = lambda account_id, chat_id: "ctx-token"
+        adapter._collect_media = AsyncMock()
+        image_item = {
+            "type": weixin.ITEM_IMAGE,
+            "image_item": {"media": {"full_url": "https://example.com/image"}},
+        }
+        text_item = {
+            "type": weixin.ITEM_TEXT,
+            "text_item": {"text": "question answered by the agent"},
+        }
+
+        async def reply(event):
+            assert event.text == "question answered by the agent"
+            await adapter.send(
+                chat_id=event.source.chat_id,
+                content="answer",
+                reply_to=event.message_id,
+            )
+
+        adapter.handle_message = reply
+        asyncio.run(
+            adapter._process_message(
+                {
+                    "from_user_id": "wxid_test123",
+                    "message_id": 9002,
+                    "context_token": "ctx-token",
+                    "item_list": [image_item, text_item],
+                }
+            )
+        )
+
+        assert send_message_mock.await_args.kwargs["referenced_item"] == {
+            **text_item,
+            "msg_id": "9002",
+        }
+
+    @pytest.mark.asyncio
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    async def test_merged_active_session_burst_does_not_quote_one_fragment(
+        self,
+        send_message_mock,
+    ):
+        adapter = _make_adapter()
+        adapter._send_session = object()
+        adapter._token = "test-token"
+        adapter._token_store.get = lambda account_id, chat_id: "ctx-token"
+        adapter._busy_text_debounce_seconds = 60
+        adapter._busy_text_hard_cap_seconds = 60
+        adapter._keep_typing = AsyncMock()
+        adapter.stop_typing = AsyncMock()
+
+        source = adapter.build_source(
+            chat_id="wxid_test123",
+            chat_type="dm",
+            user_id="wxid_test123",
+        )
+        first = MessageEvent(
+            text="first fragment",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="9003",
+        )
+        second = MessageEvent(
+            text="second fragment",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="9004",
+        )
+        for event in (first, second):
+            adapter._reply_items[(source.chat_id, event.message_id)] = {
+                "type": weixin.ITEM_TEXT,
+                "msg_id": event.message_id,
+                "text_item": {"text": event.text},
+            }
+
+        adapter.set_message_handler(AsyncMock(return_value="combined answer"))
+        session_key = build_session_key(source)
+        adapter._active_sessions[session_key] = asyncio.Event()
+
+        await adapter.handle_message(first)
+        await adapter.handle_message(second)
+        assert await adapter._flush_text_debounce_now(session_key) is True
+        merged = adapter._pending_messages.pop(session_key)
+        assert merged.text == "first fragment\nsecond fragment"
+
+        await adapter._process_message_background(merged, session_key)
+
+        assert send_message_mock.await_args.kwargs["referenced_item"] is None
 
     @patch("gateway.platforms.weixin.asyncio.sleep", new_callable=AsyncMock)
     @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)

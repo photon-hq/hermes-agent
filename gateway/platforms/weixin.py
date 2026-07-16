@@ -986,33 +986,46 @@ def _coerce_bool(value: Any, default: bool = True) -> bool:
     return default
 
 
-def _extract_text(item_list: List[Dict[str, Any]]) -> str:
+def _preferred_text_item(
+    item_list: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Return the item whose text represents the inbound message."""
     for item in item_list:
-        if item.get("type") == ITEM_TEXT:
-            text = str((item.get("text_item") or {}).get("text") or "")
-            ref = item.get("ref_msg") or {}
-            ref_item = ref.get("message_item") or {}
-            ref_type = ref_item.get("type")
-            if ref_type in {ITEM_IMAGE, ITEM_VIDEO, ITEM_FILE, ITEM_VOICE}:
-                title = ref.get("title") or ""
-                prefix = f"[引用媒体: {title}]\n" if title else "[引用媒体]\n"
-                return f"{prefix}{text}".strip()
-            if ref_item:
-                parts: List[str] = []
-                if ref.get("title"):
-                    parts.append(str(ref["title"]))
-                ref_text = _extract_text([ref_item])
-                if ref_text:
-                    parts.append(ref_text)
-                if parts:
-                    return f"[引用: {' | '.join(parts)}]\n{text}".strip()
-            return text
+        if isinstance(item, dict) and item.get("type") == ITEM_TEXT:
+            return item
     for item in item_list:
-        if item.get("type") == ITEM_VOICE:
+        if isinstance(item, dict) and item.get("type") == ITEM_VOICE:
             voice_text = str((item.get("voice_item") or {}).get("text") or "")
             if voice_text:
-                return voice_text
-    return ""
+                return item
+    return None
+
+
+def _extract_text(item_list: List[Dict[str, Any]]) -> str:
+    item = _preferred_text_item(item_list)
+    if item is None:
+        return ""
+    if item.get("type") == ITEM_VOICE:
+        return str((item.get("voice_item") or {}).get("text") or "")
+
+    text = str((item.get("text_item") or {}).get("text") or "")
+    ref = item.get("ref_msg") or {}
+    ref_item = ref.get("message_item") or {}
+    ref_type = ref_item.get("type")
+    if ref_type in {ITEM_IMAGE, ITEM_VIDEO, ITEM_FILE, ITEM_VOICE}:
+        title = ref.get("title") or ""
+        prefix = f"[引用媒体: {title}]\n" if title else "[引用媒体]\n"
+        return f"{prefix}{text}".strip()
+    if ref_item:
+        parts: List[str] = []
+        if ref.get("title"):
+            parts.append(str(ref["title"]))
+        ref_text = _extract_text([ref_item])
+        if ref_text:
+            parts.append(ref_text)
+        if parts:
+            return f"[引用: {' | '.join(parts)}]\n{text}".strip()
+    return text
 
 
 def _message_type_from_media(media_types: List[str], text: str) -> MessageType:
@@ -1436,10 +1449,12 @@ class WeixinAdapter(BasePlatformAdapter):
             return
 
         if message_id:
-            referenced_item = next(
-                (item for item in item_list if isinstance(item, dict)),
-                None,
-            )
+            referenced_item = _preferred_text_item(item_list)
+            if referenced_item is None:
+                referenced_item = next(
+                    (item for item in item_list if isinstance(item, dict)),
+                    None,
+                )
             if referenced_item is not None:
                 referenced_item = dict(referenced_item)
                 # RefMessage identifies the source at message_item.msg_id

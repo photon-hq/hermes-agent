@@ -1374,6 +1374,12 @@ class EphemeralReply(str):
         return str.__str__(self)
 
 
+def _clear_merged_event_reply_anchor(event: MessageEvent) -> None:
+    """Drop fragment-level anchors from a synthetic merged event."""
+    event.message_id = None
+    event.reply_to_message_id = None
+
+
 def merge_pending_message_event(
     pending_messages: Dict[str, MessageEvent],
     session_key: str,
@@ -1404,6 +1410,7 @@ def merge_pending_message_event(
             existing.media_types.extend(event.media_types)
             if event.text:
                 existing.text = BasePlatformAdapter._merge_caption(existing.text, event.text)
+            _clear_merged_event_reply_anchor(existing)
             return
 
         if existing_has_media or incoming_has_media:
@@ -1422,6 +1429,7 @@ def merge_pending_message_event(
                 and event.message_type != MessageType.TEXT
             ):
                 existing.message_type = event.message_type
+            _clear_merged_event_reply_anchor(existing)
             return
 
         if (
@@ -1431,6 +1439,7 @@ def merge_pending_message_event(
         ):
             if event.text:
                 existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
+            _clear_merged_event_reply_anchor(existing)
             return
 
     pending_messages[session_key] = event
@@ -3046,12 +3055,7 @@ class BasePlatformAdapter(ABC):
                     if state.event.text
                     else event.text
                 )
-            latest_message_id = getattr(event, "message_id", None)
-            latest_anchor = latest_message_id or getattr(event, "reply_to_message_id", None)
-            if latest_message_id is not None:
-                state.event.message_id = str(latest_message_id)
-            if latest_anchor is not None and hasattr(state.event, "reply_to_message_id"):
-                state.event.reply_to_message_id = str(latest_anchor)
+            _clear_merged_event_reply_anchor(state.event)
             state.last_ts = now
 
         if state.task is not None and not state.task.done():
