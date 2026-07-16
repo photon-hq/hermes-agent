@@ -94,6 +94,7 @@ BACKOFF_DELAY_SECONDS = 30
 SESSION_EXPIRED_ERRCODE = -14
 RATE_LIMIT_ERRCODE = -2  # iLink frequency limit — backoff and retry
 MESSAGE_DEDUP_TTL_SECONDS = 300
+MAX_REPLY_ITEM_CACHE_SIZE = 512
 
 
 def _is_stale_session_ret(
@@ -436,6 +437,7 @@ async def _send_message(
     text: str,
     context_token: Optional[str],
     client_id: str,
+    referenced_item: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Send a text message via iLink sendmessage API.
 
@@ -444,13 +446,21 @@ async def _send_message(
     """
     if not text or not text.strip():
         raise ValueError("_send_message: text must not be empty")
+    text_item: Dict[str, Any] = {
+        "type": ITEM_TEXT,
+        "text_item": {"text": text},
+    }
+    if referenced_item:
+        # iLink quotes live on the outbound MessageItem and wrap the original
+        # MessageItem (Tencent openclaw-weixin's RefMessage wire type).
+        text_item["ref_msg"] = {"message_item": referenced_item}
     message: Dict[str, Any] = {
         "from_user_id": "",
         "to_user_id": to,
         "client_id": client_id,
         "message_type": MSG_TYPE_BOT,
         "message_state": MSG_STATE_FINISH,
-        "item_list": [{"type": ITEM_TEXT, "text_item": {"text": text}}],
+        "item_list": [text_item],
     }
     if context_token:
         message["context_token"] = context_token
@@ -1193,6 +1203,7 @@ class WeixinAdapter(BasePlatformAdapter):
         self._send_session: Optional[aiohttp.ClientSession] = None
         self._poll_task: Optional[asyncio.Task] = None
         self._dedup = MessageDeduplicator(ttl_seconds=MESSAGE_DEDUP_TTL_SECONDS)
+        self._reply_items: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
         self._account_id = str(extra.get("account_id") or os.getenv("WEIXIN_ACCOUNT_ID", "")).strip()
         self._token = str(config.token or extra.get("token") or os.getenv("WEIXIN_TOKEN", "")).strip()
@@ -1424,6 +1435,22 @@ class WeixinAdapter(BasePlatformAdapter):
         if not text and not media_paths:
             return
 
+        if message_id:
+            referenced_item = next(
+                (item for item in item_list if isinstance(item, dict)),
+                None,
+            )
+            if referenced_item is not None:
+                referenced_item = dict(referenced_item)
+                # RefMessage identifies the source at message_item.msg_id
+                # (string), while the inbound envelope message_id is numeric.
+                referenced_item["msg_id"] = str(
+                    referenced_item.get("msg_id") or message_id
+                )
+                self._reply_items[(effective_chat_id, message_id)] = referenced_item
+                while len(self._reply_items) > MAX_REPLY_ITEM_CACHE_SIZE:
+                    self._reply_items.pop(next(iter(self._reply_items)))
+
         source = self.build_source(
             chat_id=effective_chat_id,
             chat_type=chat_type,
@@ -1576,6 +1603,7 @@ class WeixinAdapter(BasePlatformAdapter):
         chunk: str,
         context_token: Optional[str],
         client_id: str,
+        referenced_item: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Send a single text chunk with per-chunk retry and backoff.
 
@@ -1596,6 +1624,7 @@ class WeixinAdapter(BasePlatformAdapter):
                     text=chunk,
                     context_token=context_token,
                     client_id=client_id,
+                    referenced_item=referenced_item,
                 )
                 # Check iLink response for session-expired error
                 if resp and isinstance(resp, dict):
@@ -1675,6 +1704,7 @@ class WeixinAdapter(BasePlatformAdapter):
         if not self._send_session or not self._token:
             return SendResult(success=False, error="Not connected")
         context_token = self._token_store.get(self._account_id, chat_id)
+        referenced_item = self._reply_items.get((str(chat_id), str(reply_to))) if reply_to is not None else None
         last_message_id: Optional[str] = None
 
         # Extract MEDIA: tags and bare local file paths before text delivery.
@@ -1723,6 +1753,7 @@ class WeixinAdapter(BasePlatformAdapter):
                     chunk=chunk,
                     context_token=context_token,
                     client_id=client_id,
+                    referenced_item=referenced_item if idx == 0 else None,
                 )
                 last_message_id = client_id
                 if idx < len(chunks) - 1 and self._send_chunk_delay_seconds > 0:

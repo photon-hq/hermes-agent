@@ -361,6 +361,152 @@ class TestWeixinSendMessageIntegration:
         )
 
 
+class TestWeixinQuoteReplies:
+    @patch("gateway.platforms.weixin._api_post", new_callable=AsyncMock)
+    def test_send_message_embeds_referenced_item_in_text_item(self, api_post_mock):
+        referenced_item = {
+            "type": weixin.ITEM_TEXT,
+            "msg_id": "item-42",
+            "text_item": {"text": "original question"},
+        }
+
+        asyncio.run(
+            weixin._send_message(
+                AsyncMock(),
+                base_url="https://weixin.example.com",
+                token="test-token",
+                to="wxid_test123",
+                text="answer",
+                context_token="ctx-token",
+                client_id="client-1",
+                referenced_item=referenced_item,
+            )
+        )
+
+        assert api_post_mock.await_args.kwargs["payload"] == {
+            "msg": {
+                "from_user_id": "",
+                "to_user_id": "wxid_test123",
+                "client_id": "client-1",
+                "message_type": weixin.MSG_TYPE_BOT,
+                "message_state": weixin.MSG_STATE_FINISH,
+                "item_list": [
+                    {
+                        "type": weixin.ITEM_TEXT,
+                        "text_item": {"text": "answer"},
+                        "ref_msg": {"message_item": referenced_item},
+                    }
+                ],
+                "context_token": "ctx-token",
+            }
+        }
+
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_response_quotes_triggering_inbound_item(self, send_message_mock):
+        adapter = _make_adapter()
+        adapter._poll_session = object()
+        adapter._send_session = object()
+        adapter._token = "test-token"
+        adapter._token_store.get = lambda account_id, chat_id: "ctx-token"
+        inbound_item = {
+            "type": weixin.ITEM_TEXT,
+            "text_item": {"text": "original question"},
+        }
+
+        async def reply(event):
+            assert event.message_id == "9001"
+            await adapter.send(
+                chat_id=event.source.chat_id,
+                content="answer",
+                reply_to=event.message_id,
+            )
+
+        adapter.handle_message = reply
+        asyncio.run(
+            adapter._process_message(
+                {
+                    "from_user_id": "wxid_test123",
+                    "message_id": 9001,
+                    "context_token": "ctx-token",
+                    "item_list": [inbound_item],
+                }
+            )
+        )
+
+        assert send_message_mock.await_args.kwargs["referenced_item"] == {
+            **inbound_item,
+            "msg_id": "9001",
+        }
+
+    @patch("gateway.platforms.weixin.asyncio.sleep", new_callable=AsyncMock)
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_chunked_response_quotes_only_first_chunk(self, send_message_mock, sleep_mock):
+        adapter = _make_adapter()
+        adapter._send_session = object()
+        adapter._token = "test-token"
+        adapter.MAX_MESSAGE_LENGTH = 12
+        adapter._token_store.get = lambda account_id, chat_id: "ctx-token"
+        referenced_item = {
+            "type": weixin.ITEM_TEXT,
+            "msg_id": "item-42",
+            "text_item": {"text": "original question"},
+        }
+        adapter._reply_items[("wxid_test123", "9001")] = referenced_item
+
+        result = asyncio.run(
+            adapter.send(
+                "wxid_test123",
+                "first\n\nsecond\n\nthird",
+                reply_to="9001",
+            )
+        )
+
+        assert result.success is True
+        assert send_message_mock.await_count == 3
+        assert send_message_mock.await_args_list[0].kwargs["referenced_item"] == referenced_item
+        assert all(
+            call.kwargs["referenced_item"] is None
+            for call in send_message_mock.await_args_list[1:]
+        )
+
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_send_without_reply_to_does_not_quote(self, send_message_mock):
+        adapter = _make_adapter()
+        adapter._send_session = object()
+        adapter._token = "test-token"
+        adapter._token_store.get = lambda account_id, chat_id: "ctx-token"
+
+        result = asyncio.run(adapter.send("wxid_test123", "answer", reply_to=None))
+
+        assert result.success is True
+        assert send_message_mock.await_args.kwargs["referenced_item"] is None
+
+    @patch("gateway.platforms.weixin.asyncio.sleep", new_callable=AsyncMock)
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_quote_retry_reuses_reference_and_client_id(self, send_message_mock, sleep_mock):
+        adapter = _make_adapter()
+        adapter._send_session = object()
+        adapter._token = "test-token"
+        adapter._token_store.get = lambda account_id, chat_id: "ctx-token"
+        referenced_item = {
+            "type": weixin.ITEM_TEXT,
+            "msg_id": "item-42",
+            "text_item": {"text": "original question"},
+        }
+        adapter._reply_items[("wxid_test123", "9001")] = referenced_item
+        send_message_mock.side_effect = [RuntimeError("temporary failure"), {}]
+
+        result = asyncio.run(
+            adapter.send("wxid_test123", "answer", reply_to="9001")
+        )
+
+        assert result.success is True
+        first_try, retry = send_message_mock.await_args_list
+        assert first_try.kwargs["client_id"] == retry.kwargs["client_id"]
+        assert first_try.kwargs["referenced_item"] == referenced_item
+        assert retry.kwargs["referenced_item"] == referenced_item
+
+
 class TestWeixinChunkDelivery:
     def _connected_adapter(self) -> WeixinAdapter:
         adapter = _make_adapter()
