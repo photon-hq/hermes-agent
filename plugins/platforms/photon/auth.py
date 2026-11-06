@@ -153,7 +153,7 @@ def ensure_sdk() -> bool:
 
 
 def _api_host() -> str:
-    return (os.getenv("PHOTON_API_HOST") or DEFAULT_API_HOST).rstrip("/")
+    return (_get_scoped_secret("PHOTON_API_HOST") or DEFAULT_API_HOST).rstrip("/")
 
 
 def _photon(token: Optional[str] = None, *, timeout: float = 30.0) -> Any:

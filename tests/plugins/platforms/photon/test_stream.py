@@ -38,12 +38,15 @@ class FakeSocket:
         self.handlers[event] = handler
 
     async def connect(self, url: str, **kwargs: Any) -> None:
-        if self.factory.connect_error is not None:
-            raise self.factory.connect_error
+        if self.factory.connect_errors:
+            raise self.factory.connect_errors.pop(0)
         self.url, self.connect_kwargs = url, kwargs
 
     async def call(self, event: str, data: Any = None, timeout: float | None = None) -> Any:
         self.calls.append((event, data))
+        if self.factory.drop_during_subscribe:
+            self.factory.drop_during_subscribe = False
+            self.drop()  # the server closes the socket right after it acks the subscribe
         return self.factory.ack
 
     async def disconnect(self) -> None:
@@ -60,7 +63,8 @@ class Sockets:
     def __init__(self) -> None:
         self.made: list[FakeSocket] = []
         self.ack: Any = {"ok": True}
-        self.connect_error: BaseException | None = None
+        self.connect_errors: list[BaseException] = []
+        self.drop_during_subscribe = False
 
     def __call__(self, **kwargs: Any) -> FakeSocket:
         self.made.append(FakeSocket(self, **kwargs))
@@ -188,6 +192,24 @@ async def test_spectrum_credentials_get_the_migration_notice(photon_home, socket
 
 
 @pytest.mark.asyncio
+async def test_a_spectrum_install_reaches_the_notice_through_gateway_startup(photon_home, monkeypatch):
+    from gateway.config import Platform, load_gateway_config
+    from gateway.platform_registry import platform_registry
+    from hermes_cli.plugins import discover_plugins
+
+    discover_plugins()
+    monkeypatch.setenv("PHOTON_PROJECT_ID", "3f1c2a9e-0000-4000-8000-000000000001")
+    monkeypatch.setenv("PHOTON_PROJECT_SECRET", "spectrum-secret")
+
+    config = load_gateway_config().platforms[Platform("photon")]
+    a = platform_registry.create_adapter("photon", config)
+
+    assert config.enabled and a is not None  # the plugin loader's own copy of PhotonAdapter
+    assert await a.connect() is False
+    assert a.fatal_error_code == "SPECTRUM_LEGACY"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("retryable", [True, False])
 async def test_a_refused_subscription_fails_the_connect(api, sockets, adapter, retryable):
     sockets.ack = {"ok": False, "error": {"code": "invalid_cursor", "message": "no", "retryable": retryable}}
@@ -236,11 +258,35 @@ async def test_a_dropped_stream_resubscribes_from_the_last_handled_cursor(api, s
 
 
 @pytest.mark.asyncio
+async def test_a_drop_during_the_subscribe_handshake_still_reconnects(api, sockets, adapter):
+    sockets.drop_during_subscribe = True
+    a = adapter()
+
+    assert await a.connect() is True
+    await async_wait_until(lambda: len(sockets.subscribed()) == 2, what="resubscribe")
+
+    assert a._sio is sockets.made[-1]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_reconnect_is_retried(api, sockets, adapter):
+    a = adapter()
+    assert await a.connect()
+    sockets.connect_errors = [photon_adapter.socketio.exceptions.ConnectionError("connection refused")]
+
+    sockets.made[0].drop()
+    await async_wait_until(lambda: len(sockets.subscribed()) == 2, what="resubscribe after a failed attempt")
+
+    assert len(sockets.made) == 3
+    assert (a._stream_running, a.fatal_error_code) == (True, None)
+
+
+@pytest.mark.asyncio
 async def test_a_reconnect_with_a_revoked_key_stops_for_good(api, sockets, adapter):
     a = adapter()
     assert await a.connect()
     api.on("GET", PROJECT, FakePhotonApi.problem(401, "UNAUTHORIZED"))
-    sockets.connect_error = photon_adapter.socketio.exceptions.ConnectionError("Unexpected response from server")
+    sockets.connect_errors = [photon_adapter.socketio.exceptions.ConnectionError("Unexpected response from server")]
 
     sockets.made[0].drop()
     await async_wait_until(lambda: a.fatal_error_code == "AUTH_REJECTED", what="fatal AUTH_REJECTED")

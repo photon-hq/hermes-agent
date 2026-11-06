@@ -22,6 +22,7 @@ MESSAGES = f"{P}/messages"
 TYPING = f"{P}/spaces/{FakePhotonApi.SPACE_ID}/typing"
 SENT_ID = "pho_msg_00000000000000000000000009"
 ATTACHMENT_ID = "pho_att_00000000000000000000000001"
+GROUP_ID = "pho_spc_00000000000000000000000002"
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
 ROUTE = photon_adapter._Route(FakePhotonApi.SPACE_ID, FakePhotonApi.AGENT_ID)
 
@@ -120,6 +121,18 @@ async def test_a_phone_number_resolves_to_the_conversation_it_texted_from(photon
     [send] = photon_async_api.calls("POST", MESSAGES)
     assert FakePhotonApi.body(send)["spaceId"] == FakePhotonApi.SPACE_ID
     assert FakePhotonApi.body(send)["senderId"] == FakePhotonApi.AGENT_ID
+
+
+@pytest.mark.asyncio
+async def test_a_phone_number_never_resolves_to_a_group_it_wrote_in(photon_async_api):
+    group = FakePhotonApi.message(kind="group", message_id="pho_msg_00000000000000000000000005")
+    group["space"] = {**group["space"], "id": GROUP_ID}
+    photon_async_api.on("GET", MESSAGES, {"items": [group, FakePhotonApi.message()]})
+    photon_async_api.on("POST", MESSAGES, _sent())
+
+    assert (await _adapter(known_route=False).send(FakePhotonApi.PHONE, "hello")).success
+
+    assert FakePhotonApi.body(photon_async_api.calls("POST", MESSAGES)[0])["spaceId"] == FakePhotonApi.SPACE_ID
 
 
 @pytest.mark.asyncio

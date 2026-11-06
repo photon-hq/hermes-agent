@@ -110,7 +110,8 @@ def _credentials(extra: Optional[dict] = None) -> tuple[str, str]:
 
 
 def validate_config(cfg: PlatformConfig) -> bool:
-    return all(_credentials(cfg.extra))
+    """Photon 2.0 credentials, or Spectrum ones: those pass so connect() can report the move."""
+    return all(_credentials(cfg.extra)) or photon_auth.has_legacy_credentials()
 
 
 def is_connected(cfg: PlatformConfig) -> bool:
@@ -243,7 +244,8 @@ class _PhotonApi:
             for message in page.get("items") or []:
                 handle = (message.get("sentBy") or {}).get("handle") or ""
                 route = _route_of(message)
-                if route and (by_space or photon_auth._normalize_phone(handle) == key):
+                direct = (message.get("space") or {}).get("kind") == "direct"
+                if route and (by_space or (direct and photon_auth._normalize_phone(handle) == key)):
                     self.remember(route, None if by_space else handle)
                     return route
             token = page.get("nextPageToken")
@@ -505,6 +507,9 @@ class PhotonAdapter(BasePlatformAdapter):
         sio.on("delivery", lambda event, metadata=None: self._queue.put_nowait((generation, event, metadata or {})))
         sio.on("delivery_error", self._on_delivery_error)
         sio.on("disconnect", lambda *_reason: self._on_disconnect(sio))
+        # Current before the first await, so a disconnect during the handshake is not missed.
+        self._sio = sio
+        self._stream_closed.clear()
         try:
             await sio.connect(
                 photon_auth._api_host(), headers={"Authorization": f"Bearer {self._project_api_key}"},
@@ -515,11 +520,10 @@ class PhotonAdapter(BasePlatformAdapter):
             if not (isinstance(ack, dict) and ack.get("ok") is True):
                 raise _SubscribeRefused(ack.get("error") if isinstance(ack, dict) else None)
         except BaseException:
+            self._on_disconnect(sio)
             with contextlib.suppress(OSError, socketio.exceptions.SocketIOError):
                 await sio.disconnect()
             raise
-        self._sio = sio
-        self._stream_closed.clear()
 
     def _on_disconnect(self, sio: Any) -> None:
         if sio is self._sio:
@@ -616,7 +620,8 @@ class PhotonAdapter(BasePlatformAdapter):
             logger.warning("[photon] received message %s has no space or agent; ignoring it", message_id)
             return
         handle = (message.get("sentBy") or {}).get("handle") or ""
-        self._api.remember(route, handle)
+        direct = (message.get("space") or {}).get("kind") == "direct"
+        self._api.remember(route, handle if direct else None)  # a number names its DM, never a group
         await self._deliver_message(message, route, handle)
         if _env_flag("PHOTON_READ_RECEIPTS", "true"):
             try:
