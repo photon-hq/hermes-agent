@@ -613,11 +613,11 @@ The image uses Debian 13.4 and includes:
 - A Python 3.14 environment synchronized from the committed `uv.lock`, followed
   by a no-dependency editable install of Hermes.
 - The curated extras `all`, `messaging`, `otlp`, `anthropic`, `bedrock`,
-  `azure-identity`, and `matrix`. This is not `--all-extras`.
+  `azure-identity`, `matrix`, and `photon`. This is not `--all-extras`.
 - Node.js 26 and npm from the digest-pinned Node source image.
 - PM-pinned uv, full Chromium, FFmpeg, and ripgrep in `/opt/hermes/tools`.
 - System Git, OpenSSH, Docker CLI, and Chromium shared libraries.
-- Prebuilt TUI/dashboard assets and baked Photon sidecar dependencies.
+- Prebuilt TUI/dashboard assets.
 - s6-overlay for supervision and zombie-process cleanup.
 
 Chromium is staged through PM, not `npx playwright install`. The build records
