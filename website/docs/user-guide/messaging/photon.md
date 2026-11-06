@@ -41,7 +41,7 @@ automatically.
 
 ## Prerequisites
 
-- A Photon account — sign up at [app.photon.codes][app]
+- A Photon 2.0 account — sign up at [app.beta.photon.codes][app]
 - Node.js: Hermes uses its managed Node when available.
   `hermes pm install node` provisions the pin; the adapter can fall back to PATH.
 - A phone number that can receive iMessage (used to bind your account)
@@ -59,32 +59,36 @@ hermes gateway setup
 …or run the Photon setup directly (the wizard calls the same flow):
 
 ```bash
-# Device-code login + project + user + sidecar deps, all in one
 hermes photon setup --phone +15551234567
 ```
 
 The setup, in order:
 
-1. **Device login** (`client_id=photon-cli`) — opens
-   `https://app.photon.codes/` for approval and stores the bearer token.
-2. **Finds or creates** the `Hermes Agent` project on your account.
-3. **Enables Spectrum**, reads the project's Spectrum id, and rotates
-   the project secret.
-4. **Registers your phone number** as a Spectrum user — skipped if a
-   user with that number already exists, so re-running is safe.
-5. **Prints your assigned iMessage line** — the number you text to reach
-   your agent.
-6. **Runs `npm install`** inside the plugin's sidecar directory. On
-   read-only / immutable install trees (hosted Docker images, Podman,
-   Nix) the sidecar automatically falls back to a writable mirror under
-   `~/.hermes/photon/sidecar`; set `PHOTON_SIDECAR_DIR` to pin an
-   explicit location.
+1. **Project and API key.** If `PHOTON_PROJECT_ID` and `PHOTON_API_KEY` are already set and
+   Photon accepts the key, setup uses them and never opens a browser. Otherwise it signs you
+   in with Photon's device login (open `https://auth.photon.codes/device` on any device and
+   enter the code), finds or creates the `Hermes Agent` project, and mints a project API key.
+2. **Assigns a shared iMessage line** to your phone number (re-running reuses it) and prints
+   the number you text to reach your agent.
+3. **Waits for your first text**: a shared line can only message you after you have messaged
+   it once. `hermes photon status` shows when routing is live.
+4. **Enables the platform** and allowlists your number.
 
-Runtime credentials are written to `~/.hermes/.env`
-(`PHOTON_PROJECT_ID` = the Spectrum project id, `PHOTON_PROJECT_SECRET`),
-the same place every other channel keeps its token. Management metadata
-(device token, dashboard project id) lives in `~/.hermes/auth.json` under
+Runtime credentials are written to `~/.hermes/.env` (`PHOTON_PROJECT_ID`,
+`PHOTON_API_KEY`), the same place every other channel keeps its token. Management metadata
+(the device-login session, project and key ids) lives in `~/.hermes/auth.json` under
 `credential_pool.photon` / `credential_pool.photon_project`.
+
+**Without a browser:** create a project API key in the [Photon dashboard][app] and set
+`PHOTON_PROJECT_ID=pho_prj_...` and `PHOTON_API_KEY=pho_sk_...` in `~/.hermes/.env` (or
+the environment, e.g. in Docker). Setup and the gateway use them as they are.
+
+:::note Coming from Photon Spectrum
+Hermes now runs on Photon 2.0. If your Hermes still has a `PHOTON_PROJECT_SECRET` from Photon
+Spectrum, create a Photon 2.0 account at [app.beta.photon.codes][app] and run
+`hermes photon setup`. It keeps your Spectrum credentials in `auth.json` so your Spectrum
+projects can move over once Photon's migration tool ships.
+:::
 
 ## Authorizing users
 
@@ -238,8 +242,8 @@ Common issues:
 
 | Variable                  | Default            | Notes                                      |
 |---------------------------|--------------------|--------------------------------------------|
-| `PHOTON_PROJECT_ID`       | from `.env`        | Spectrum project id (the SDK's `projectId`); set by setup |
-| `PHOTON_PROJECT_SECRET`   | from `.env`        | Project secret; set by setup               |
+| `PHOTON_PROJECT_ID`       | from `.env`        | Photon 2.0 project id (`pho_prj_...`); set by setup |
+| `PHOTON_API_KEY`          | from `.env`        | Project API key (`pho_sk_...`); set by setup |
 | `PHOTON_SIDECAR_PORT`     | `8789`             | Loopback port for the sidecar control + inbound channel |
 | `PHOTON_SIDECAR_AUTOSTART`| `true`             | Whether the adapter spawns the sidecar     |
 | `PHOTON_HOME_CHANNEL`     | (unset)            | Default space id for cron / notifications  |
@@ -248,8 +252,7 @@ Common issues:
 | `PHOTON_ALLOW_ALL_USERS`  | `false`            | Dev only — accept any sender               |
 | `PHOTON_REQUIRE_MENTION`  | `false`            | Require a wake word before responding in groups |
 | `PHOTON_MENTION_PATTERNS` | Hermes wake words  | JSON list / comma / newline regex patterns for group mentions |
-| `PHOTON_DASHBOARD_HOST`   | `app.photon.codes` | Override the dashboard / device-login host |
-| `PHOTON_SPECTRUM_HOST`    | `spectrum.photon.codes` | Override the Spectrum API host |
+| `PHOTON_API_HOST`         | `api.photon.codes` | Override the Photon API host               |
 
 [photon]: https://photon.codes/
-[app]: https://app.photon.codes/
+[app]: https://app.beta.photon.codes/
