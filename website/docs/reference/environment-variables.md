@@ -700,8 +700,9 @@ Connect Hermes to [Photon](https://photon.codes/) / Spectrum (iMessage and other
 
 | Variable | Description |
 |----------|-------------|
-| `PHOTON_PROJECT_ID` | Spectrum project id (the project's `spectrumProjectId`; set by `hermes photon setup`). |
-| `PHOTON_PROJECT_SECRET` | Project secret paired with the Spectrum project id (set by `hermes photon setup`). |
+| `PHOTON_PROJECT_ID` | Photon 2.0 project id (`pho_prj_...`; set by `hermes photon setup`). |
+| `PHOTON_API_KEY` | Photon 2.0 project API key (`pho_sk_...`; set by `hermes photon setup`). |
+| `PHOTON_PROJECT_SECRET` | Photon Spectrum project secret (before Photon 2.0); `hermes photon setup` moves it into auth.json. |
 | `PHOTON_ALLOWED_USERS` | Comma-separated E.164 phone numbers allowed to talk to the bot. |
 | `PHOTON_ALLOW_ALL_USERS` | Allow any sender to trigger the bot (dev only — disables allowlist). |
 | `PHOTON_REQUIRE_MENTION` | Ignore group-chat messages unless they match a mention wake word (`true`/`false`, default `false`). |
@@ -714,8 +715,7 @@ Connect Hermes to [Photon](https://photon.codes/) / Spectrum (iMessage and other
 | `PHOTON_TELEMETRY` | Enable Spectrum SDK telemetry in the sidecar (`true`/`false`, default `false`; toggle with `hermes photon telemetry on|off`). |
 | `PHOTON_SIDECAR_PORT` | Loopback port for the Node sidecar control + inbound channel (default `8789`). |
 | `PHOTON_SIDECAR_AUTOSTART` | Spawn the Node sidecar on connect (`true`/`false`, default `true`). |
-| `PHOTON_DASHBOARD_HOST` | Photon Dashboard API host (default `https://app.photon.codes`). |
-| `PHOTON_SPECTRUM_HOST` | Photon Spectrum API host (default `https://spectrum.photon.codes`). |
+| `PHOTON_API_HOST` | Photon API host (default `https://api.photon.codes`). |
 
 ### Buzz (Nostr communities)
 

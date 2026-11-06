@@ -38,7 +38,7 @@ MIGRATED_ADAPTER_MODULES = [
     ("plugins.platforms.feishu.adapter", "FEISHU_APP_SECRET"),
     ("plugins.platforms.wecom.adapter", "WECOM_SECRET"),
     ("plugins.platforms.photon.adapter", "PHOTON_PROJECT_SECRET"),
-    ("plugins.platforms.photon.auth", "PHOTON_PROJECT_SECRET"),
+    ("plugins.platforms.photon.auth", "PHOTON_API_KEY"),
     ("plugins.platforms.buzz.adapter", "BUZZ_PRIVATE_KEY"),
     ("plugins.platforms.bluebubbles.adapter", "BLUEBUBBLES_PASSWORD"),
     ("gateway.platforms.api_server", "API_SERVER_KEY"),

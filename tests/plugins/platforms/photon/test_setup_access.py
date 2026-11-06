@@ -1,9 +1,10 @@
-"""Tests for `hermes photon setup`'s access auto-configuration.
+"""`hermes photon setup` end to end against an in-process Photon 2.0 API (see conftest.py).
 
-`_autoconfigure_access` allowlists the operator and points the cron home
-channel at their DM, writing to the per-test ~/.hermes/.env (the hermetic
-HERMES_HOME fixture isolates this). It must fill only unset keys so a re-run
-never clobbers a hand-tuned allowlist.
+Setup must reuse project credentials that Photon still accepts without any browser sign-in,
+replace a refused key (revoking the old one), provision a new project for a first run, move
+Photon Spectrum credentials aside, and never report routing live before the operator has
+texted their shared line. `_autoconfigure_access` fills only unset keys, so a re-run never
+clobbers a hand-tuned allowlist.
 """
 from __future__ import annotations
 
@@ -11,220 +12,141 @@ import argparse
 
 import pytest
 
-from hermes_cli.config import get_env_value
-from plugins.platforms.photon.adapter import _env_enablement
+from hermes_cli.config import get_env_value, save_env_value
+from plugins.platforms.photon import auth as photon_auth
 from plugins.platforms.photon import cli
+from plugins.platforms.photon.adapter import _env_enablement
+
+PROJECT_ID = "pho_prj_00000000000000000000000001"
+PHONE = "+15551234567"
+LINE = "+16282679185"
+_PROJECT = f"/v1/projects/{PROJECT_ID}"
+_ASSIGNMENTS = f"{_PROJECT}/platforms/imessage/assignments"
 
 
-def test_autoconfigure_access_fills_unset(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("PHOTON_ALLOWED_USERS", raising=False)
-    monkeypatch.delenv("PHOTON_HOME_CHANNEL", raising=False)
+def _args(**overrides) -> argparse.Namespace:
+    values = {"project_name": None, "phone": PHONE, "first_name": None, "last_name": None, "email": None,
+              "no_browser": True, "skip_sidecar_install": False}
+    return argparse.Namespace(**{**values, **overrides})
 
-    cli._autoconfigure_access("+15551234567")
 
-    assert get_env_value("PHOTON_ALLOWED_USERS") == "+15551234567"
-    assert get_env_value("PHOTON_HOME_CHANNEL") == "+15551234567"
+@pytest.fixture
+def non_interactive(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: False, raising=False)
+
+    def _no_browser_login(_args):
+        raise AssertionError("setup must not start a device login here")
+    monkeypatch.setattr(cli, "_device_login", _no_browser_login)
+
+
+def _signed_in() -> None:
+    photon_auth._store_pool_record("photon", {
+        "access_token": "acc-session", "refresh_token": "ref-session", "expires_at": 4102444800})
+
+
+def _line_routes(photon_api, *, texted: bool) -> None:
+    photon_api.on("GET", f"{_PROJECT}/platforms/imessage", photon_api.shared_mode())
+    photon_api.on("GET", _ASSIGNMENTS, {"assignments": [photon_api.assignment(PHONE, LINE)]})
+    photon_api.on("GET", f"{_PROJECT}/messages", {"items": [photon_api.received_text(PHONE)] if texted else []})
+
+
+def test_autoconfigure_access_fills_unset(photon_home) -> None:
+    cli._autoconfigure_access(PHONE)
+
+    assert get_env_value("PHOTON_ALLOWED_USERS") == PHONE
+    assert get_env_value("PHOTON_HOME_CHANNEL") == PHONE
 
 
 def test_env_enablement_seeds_home_channel(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("PHOTON_PROJECT_ID", "project_123")
     monkeypatch.setenv("PHOTON_PROJECT_SECRET", "secret_123")
-    monkeypatch.setenv("PHOTON_HOME_CHANNEL", "+15551234567")
+    monkeypatch.setenv("PHOTON_HOME_CHANNEL", PHONE)
     monkeypatch.setenv("PHOTON_HOME_CHANNEL_NAME", "Primary DM")
 
     seed = _env_enablement()
 
     assert seed is not None
-    assert seed["home_channel"] == {
-        "chat_id": "+15551234567",
-        "name": "Primary DM",
-    }
+    assert seed["home_channel"] == {"chat_id": PHONE, "name": "Primary DM"}
 
 
+def test_configured_project_key_needs_no_sign_in(photon_api, non_interactive, monkeypatch, capsys) -> None:
+    """PHOTON_PROJECT_ID + PHOTON_API_KEY set by hand: no browser, no new key, routing verified."""
+    monkeypatch.setenv("PHOTON_PROJECT_ID", PROJECT_ID)
+    monkeypatch.setenv("PHOTON_API_KEY", "pho_sk_env")
+    photon_api.on("GET", _PROJECT, photon_api.project())
+    _line_routes(photon_api, texted=True)
 
+    rc = cli._cmd_setup(_args())
 
-def test_setup_reuses_valid_existing_secret(
-    monkeypatch: pytest.MonkeyPatch, capsys,
-) -> None:
-    """Re-running setup with a valid existing secret must NOT regenerate it."""
-    regenerate_called = False
-
-    def _fake_regenerate(token, dashboard_id):
-        nonlocal regenerate_called
-        regenerate_called = True
-        return "new_secret"
-
-    monkeypatch.setattr(cli.photon_auth, "load_photon_token", lambda: "token")
-    # Token validation (added for #72763) would otherwise hit the network.
-    monkeypatch.setattr(cli.photon_auth, "check_photon_token_valid", lambda token: True)
-    monkeypatch.setattr(cli.photon_auth, "load_dashboard_project_id", lambda: "dashboard")
-    monkeypatch.setattr(
-        cli.photon_auth,
-        "load_project_credentials",
-        lambda: ("dashboard", "existing_secret"),
-    )
-    # list_users succeeds — existing secret is valid.
-    monkeypatch.setattr(
-        cli.photon_auth, "list_users", lambda pid, secret: [],
-    )
-    monkeypatch.setattr(cli.photon_auth, "regenerate_project_secret", _fake_regenerate)
-    monkeypatch.setattr(cli.photon_auth, "store_project_credentials", lambda **kwargs: None)
-    monkeypatch.setattr(
-        cli.photon_auth,
-        "register_user_if_absent",
-        lambda *args, **kwargs: ({"id": "user_123", "phoneNumber": "+155****4567"}, True),
-    )
-    monkeypatch.setattr(cli.photon_auth, "user_assigned_line", lambda user: "+155****4321")
-    monkeypatch.setattr(cli.photon_auth, "store_user_numbers", lambda **kwargs: None)
-    monkeypatch.setattr(cli, "_install_sidecar", lambda: 0)
-
-    rc = cli._cmd_setup(
-        argparse.Namespace(
-            project_name=None,
-            phone="+155****4567",
-            first_name=None,
-            last_name=None,
-            email=None,
-            no_browser=True,
-            skip_sidecar_install=False,
-        )
-    )
-
-    assert rc == 0
-    assert not regenerate_called, "regenerate_project_secret must not be called when existing creds are valid"
     out = capsys.readouterr().out
-    assert "existing credentials valid" in out
+    assert rc == 0 and "setup complete" in out and LINE in out
     assert "restart" not in out.lower()
+    assert photon_api.calls("POST", f"{_PROJECT}/api-keys") == []
+    assert {r.headers["Authorization"] for r in photon_api.requests} == {"Bearer pho_sk_env"}
 
 
-def test_setup_regenerates_when_existing_secret_invalid(
-    monkeypatch: pytest.MonkeyPatch, capsys,
-) -> None:
-    """When existing credentials are invalid, setup must regenerate."""
-    monkeypatch.setattr(cli.photon_auth, "load_photon_token", lambda: "token")
-    # Token validation (added for #72763) would otherwise hit the network.
-    monkeypatch.setattr(cli.photon_auth, "check_photon_token_valid", lambda token: True)
-    monkeypatch.setattr(cli.photon_auth, "load_dashboard_project_id", lambda: "dashboard")
-    monkeypatch.setattr(
-        cli.photon_auth,
-        "load_project_credentials",
-        lambda: ("dashboard", "stale_secret"),
-    )
-    # list_users fails — existing secret is invalid.
-    monkeypatch.setattr(
-        cli.photon_auth,
-        "list_users",
-        lambda pid, secret: (_ for _ in ()).throw(RuntimeError("auth failed")),
-    )
-    monkeypatch.setattr(
-        cli.photon_auth,
-        "regenerate_project_secret",
-        lambda token, dashboard_id: "new_secret",
-    )
-    monkeypatch.setattr(cli.photon_auth, "store_project_credentials", lambda **kwargs: None)
-    monkeypatch.setattr(
-        cli.photon_auth,
-        "register_user_if_absent",
-        lambda *args, **kwargs: ({"id": "user_123", "phoneNumber": "+155****4567"}, True),
-    )
-    monkeypatch.setattr(cli.photon_auth, "user_assigned_line", lambda user: "+155****4321")
-    monkeypatch.setattr(cli.photon_auth, "store_user_numbers", lambda **kwargs: None)
-    monkeypatch.setattr(cli, "_install_sidecar", lambda: 0)
+def test_refused_key_is_replaced_and_the_old_one_revoked(photon_api, non_interactive, capsys) -> None:
+    save_env_value("PHOTON_PROJECT_ID", PROJECT_ID)
+    save_env_value("PHOTON_API_KEY", "pho_sk_old")
+    photon_auth._store_pool_record("photon_project", {"project_id": PROJECT_ID, "api_key_id": "pho_key_old"})
+    _signed_in()
+    photon_api.on("GET", _PROJECT, photon_api.problem(401, "NOT_AUTHENTICATED"), photon_api.project())
+    photon_api.on("POST", f"{_PROJECT}/api-keys", (201, {"apiKey": photon_api.api_key("pho_key_new"),
+                                                          "secret": "pho_sk_new"}))
+    photon_api.on("DELETE", f"{_PROJECT}/api-keys/pho_key_old", {"apiKey": photon_api.api_key("pho_key_old")})
+    _line_routes(photon_api, texted=True)
 
-    rc = cli._cmd_setup(
-        argparse.Namespace(
-            project_name=None,
-            phone="+155****4567",
-            first_name=None,
-            last_name=None,
-            email=None,
-            no_browser=True,
-            skip_sidecar_install=False,
-        )
-    )
+    rc = cli._cmd_setup(_args())
 
-    assert rc == 0
     out = capsys.readouterr().out
-    assert "new secret saved" in out
-    assert "restart it so the sidecar" in out
+    assert rc == 0 and "setup complete" in out and "hermes gateway restart" in out
+    assert get_env_value("PHOTON_API_KEY") == "pho_sk_new"
+    assert len(photon_api.calls("DELETE", f"{_PROJECT}/api-keys/pho_key_old")) == 1
+    assert "pho_sk_new" not in out
 
 
-def test_setup_without_opt_in_does_not_report_complete(
-    monkeypatch: pytest.MonkeyPatch, capsys,
-) -> None:
-    """A number that never texted its assigned line cannot route: setup must not end on
-    "complete" (non-TTY run, so the opt-in wait is skipped rather than blocking)."""
-    monkeypatch.setattr(cli.photon_auth, "load_photon_token", lambda: "token")
-    monkeypatch.setattr(cli.photon_auth, "check_photon_token_valid", lambda token: True)
-    monkeypatch.setattr(cli.photon_auth, "load_dashboard_project_id", lambda: "dashboard")
-    monkeypatch.setattr(cli.photon_auth, "load_project_credentials", lambda: ("dashboard", "s"))
-    monkeypatch.setattr(cli.photon_auth, "list_users", lambda pid, secret: [])
-    monkeypatch.setattr(cli.photon_auth, "store_project_credentials", lambda **kwargs: None)
-    monkeypatch.setattr(cli.photon_auth, "register_user_if_absent", lambda *a, **k: (
-        {"id": "u1", "phoneNumber": "+15551234567", "assignedPhoneNumber": "+16282679185", "meta": {}}, True))
-    monkeypatch.setattr(cli.photon_auth, "store_user_numbers", lambda **kwargs: None)
-    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: False, raising=False)
+def test_first_setup_creates_a_project_and_moves_spectrum_aside(photon_api, non_interactive, capsys) -> None:
+    """A Spectrum-era home: a new Photon 2.0 project, key and line; the Spectrum credentials
+    leave the runtime slots for auth.json; no first text yet, so routing is not reported live."""
+    save_env_value("PHOTON_PROJECT_ID", "8f3c-spectrum")
+    save_env_value("PHOTON_PROJECT_SECRET", "spectrum-secret")
+    _signed_in()
+    org_projects = f"/v1/organizations/{photon_api.ORG_ID}/projects"
+    photon_api.on("GET", "/v1/organizations", {"acquisitionQuestionnaireExempt": False,
+                                               "organizations": [photon_api.organization()],
+                                               "ownedOrganizationIds": [photon_api.ORG_ID]})
+    photon_api.on("GET", org_projects, {"projects": []})
+    photon_api.on("POST", org_projects, (202, photon_api.project()))
+    photon_api.on("POST", f"{_PROJECT}/api-keys", (201, {"apiKey": photon_api.api_key(), "secret": "pho_sk_new"}))
+    _line_routes(photon_api, texted=False)
+    photon_api.on("GET", _ASSIGNMENTS, {"assignments": []})
+    photon_api.on("POST", _ASSIGNMENTS, photon_api.problem(403, "FORBIDDEN"), (201, photon_api.assignment(PHONE, LINE)))
 
-    rc = cli._cmd_setup(argparse.Namespace(
-        project_name=None, phone="+15551234567", first_name=None, last_name=None,
-        email=None, no_browser=True, skip_sidecar_install=True))
+    rc = cli._cmd_setup(_args())
 
     out = capsys.readouterr().out
     assert rc == 0
-    assert "setup complete" not in out
-    assert "routing is NOT live" in out and "+16282679185" in out
+    assert "setup complete" not in out and "routing is NOT live" in out and LINE in out
+    assert photon_api.body(photon_api.calls("POST", org_projects)[0])["name"] == "Hermes Agent"
+    assert get_env_value("PHOTON_PROJECT_ID") == PROJECT_ID
+    assert get_env_value("PHOTON_API_KEY") == "pho_sk_new"
+    assert get_env_value("PHOTON_PROJECT_SECRET") is None
+    legacy = photon_auth._pool_first(photon_auth._load_auth(), "photon_legacy")
+    assert (legacy["spectrum_project_id"], legacy["project_secret"]) == ("8f3c-spectrum", "spectrum-secret")
+    # The minted key cannot take a seat; the assignment falls back to the account.
+    assert [r.headers["Authorization"] for r in photon_api.calls("POST", _ASSIGNMENTS)] == [
+        "Bearer pho_sk_new", "Bearer acc-session"]
 
 
-@pytest.mark.parametrize("dedicated_line", ["+16282679185", None])
-def test_opt_in_wait_always_names_a_line_to_text(
-    monkeypatch: pytest.MonkeyPatch, capsys, dedicated_line,
-) -> None:
-    """A row with no assignedPhoneNumber: the project-line lookup runs BEFORE the wait, and
-    with no line at all the wait is skipped (the user would have nothing to text)."""
-    monkeypatch.setattr(cli.photon_auth, "load_photon_token", lambda: "token")
-    monkeypatch.setattr(cli.photon_auth, "check_photon_token_valid", lambda token: True)
-    monkeypatch.setattr(cli.photon_auth, "load_dashboard_project_id", lambda: "dashboard")
-    monkeypatch.setattr(cli.photon_auth, "load_project_credentials", lambda: ("dashboard", "s"))
-    monkeypatch.setattr(cli.photon_auth, "list_users", lambda pid, secret: [])
-    monkeypatch.setattr(cli.photon_auth, "store_project_credentials", lambda **kwargs: None)
-    monkeypatch.setattr(cli.photon_auth, "register_user_if_absent", lambda *a, **k: (
-        {"id": "u1", "phoneNumber": "+15551234567", "meta": {}}, True))
-    monkeypatch.setattr(cli.photon_auth, "get_imessage_line", lambda token, pid: (
-        {"phoneNumber": dedicated_line} if dedicated_line else None))
-    monkeypatch.setattr(cli.photon_auth, "store_user_numbers", lambda **kwargs: None)
-    waited: list = []
-    monkeypatch.setattr(cli, "_wait_for_opt_in", lambda d, s, phone, line: waited.append(line))
+def test_setup_without_phone_does_not_report_complete(photon_api, non_interactive, monkeypatch, capsys) -> None:
+    monkeypatch.setenv("PHOTON_PROJECT_ID", PROJECT_ID)
+    monkeypatch.setenv("PHOTON_API_KEY", "pho_sk_env")
+    photon_api.on("GET", _PROJECT, photon_api.project())
 
-    rc = cli._cmd_setup(argparse.Namespace(
-        project_name=None, phone="+15551234567", first_name=None, last_name=None,
-        email=None, no_browser=True, skip_sidecar_install=True))
-
-    out = capsys.readouterr().out
-    assert rc == 0 and "setup complete" not in out
-    if dedicated_line:
-        assert waited == [dedicated_line]
-    else:
-        assert waited == [] and "skipping the opt-in wait" in out and "hermes photon status" in out
-
-
-def test_setup_without_phone_does_not_report_complete(
-    monkeypatch: pytest.MonkeyPatch, capsys,
-) -> None:
-    """No --phone and an empty answer: nothing is registered, so nothing can route."""
-    monkeypatch.setattr(cli.photon_auth, "load_photon_token", lambda: "token")
-    monkeypatch.setattr(cli.photon_auth, "check_photon_token_valid", lambda token: True)
-    monkeypatch.setattr(cli.photon_auth, "load_dashboard_project_id", lambda: "dashboard")
-    monkeypatch.setattr(cli.photon_auth, "load_project_credentials", lambda: ("dashboard", "s"))
-    monkeypatch.setattr(cli.photon_auth, "list_users", lambda pid, secret: [])
-    monkeypatch.setattr(cli.photon_auth, "store_project_credentials", lambda **kwargs: None)
-    monkeypatch.setattr(cli.photon_auth, "get_imessage_line", lambda token, pid: None)
-    monkeypatch.setattr(cli, "_prompt", lambda *a, **k: "")
-
-    rc = cli._cmd_setup(argparse.Namespace(
-        project_name=None, phone=None, first_name=None, last_name=None,
-        email=None, no_browser=True, skip_sidecar_install=True))
+    rc = cli._cmd_setup(_args(phone=None))
 
     out = capsys.readouterr().out
     assert rc == 0
     assert "setup complete" not in out
     assert "routing is NOT live" in out and "--phone" in out
+    assert photon_api.calls("GET", _ASSIGNMENTS) == []
