@@ -1,25 +1,21 @@
 """``hermes photon ...`` CLI subcommands (registered via ``ctx.register_cli_command()``):
-setup (Photon 2.0 project + API key + iMessage line), status, install-sidecar (npm install in
-the sidecar dir), telemetry [on|off]. Setup reuses the project credentials already configured
-(``PHOTON_PROJECT_ID`` + ``PHOTON_API_KEY``, e.g. set by hand with no browser) and signs in with
-Photon's device login only for the steps that need the account: finding or creating the
-project, minting its key and assigning a line.
+setup (Photon 2.0 project + API key + iMessage line) and status. Setup reuses the project
+credentials already configured (``PHOTON_PROJECT_ID`` + ``PHOTON_API_KEY``, e.g. set by hand with
+no browser) and signs in with Photon's device login only for the steps that need the account:
+finding or creating the project, minting its key and assigning a line.
 """
 from __future__ import annotations
 
 import argparse
 import contextlib
 import getpass
-import os
-import subprocess
 import sys
 from typing import Callable, Optional
 
 from hermes_cli.colors import Colors, color
 
 from . import auth as photon_auth
-from hermes_constants import display_hermes_home, find_node_executable, with_hermes_node_path
-from .sidecar_paths import _NPM_ERROR_LOG_MAX_CHARS, _npm_error_log, _sidecar_dir
+from hermes_constants import display_hermes_home
 
 
 def register_cli(parser: argparse.ArgumentParser) -> None:
@@ -35,11 +31,6 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
                          help="Don't try to open a browser for device login; print the URL only")
     p_setup.add_argument("--skip-sidecar-install", action="store_true", help=argparse.SUPPRESS)
     subs.add_parser("status", help="Show the Photon project, API key and iMessage line state")
-    subs.add_parser("install-sidecar", help="Run npm install inside the sidecar directory")
-    p_telemetry = subs.add_parser("telemetry", help="Show or toggle Spectrum SDK telemetry (on/off)")
-    p_telemetry.add_argument(
-        "state", nargs="?", choices=("on", "off"),
-        help="Turn telemetry on or off (omit to show the current state)")
     parser.set_defaults(func=dispatch)
 
 
@@ -277,7 +268,8 @@ def _cmd_setup(args: argparse.Namespace) -> int:
 
 def _autoconfigure_access(phone: str) -> None:
     """Set PHOTON_ALLOWED_USERS and PHOTON_HOME_CHANNEL to the operator's number, each only
-    when unset so a hand-tuned value is never clobbered on re-run."""
+    when unset so a hand-tuned value is never clobbered on re-run. A Photon Spectrum chat GUID
+    (``any;-;+1555…``) in PHOTON_HOME_CHANNEL is replaced: Photon 2.0 cannot deliver to it."""
     try:
         from hermes_cli.config import get_env_value, save_env_value
     except ImportError:
@@ -285,11 +277,13 @@ def _autoconfigure_access(phone: str) -> None:
     for key, label in (("PHOTON_ALLOWED_USERS", "allowlisted your number"),
                        ("PHOTON_HOME_CHANNEL", "set your DM as the cron home channel")):
         try:
-            if get_env_value(key):
+            current = get_env_value(key)
+            spectrum_guid = key == "PHOTON_HOME_CHANNEL" and ";" in (current or "")
+            if current and not spectrum_guid:
                 print(f"      {key} already set — leaving it as-is.")
                 continue
             save_env_value(key, phone)
-            print(f"  ✓ {label} ({key})")
+            print(f"  ✓ {label} ({key})" + (", replacing its Photon Spectrum chat id" if spectrum_guid else ""))
         except Exception as e:
             print(f"      could not set {key}: {e}", file=sys.stderr)
 
@@ -308,79 +302,7 @@ def _cmd_status(_args: argparse.Namespace) -> int:
     return 0
 
 
-def _telemetry_enabled() -> bool:
-    """PHOTON_TELEMETRY from env / ~/.hermes/.env; truthy set mirrors the sidecar's."""
-    try:
-        from hermes_cli.config import get_env_value
-        raw = get_env_value("PHOTON_TELEMETRY")
-    except ImportError:
-        raw = os.getenv("PHOTON_TELEMETRY")
-    return (raw or "").strip().lower() in ("1", "true", "yes", "on")
-
-
-def _cmd_telemetry(args: argparse.Namespace) -> int:
-    state = getattr(args, "state", None)
-    if state is None:
-        print(f"Photon telemetry: {'on' if _telemetry_enabled() else 'off'}")
-        print("  Toggle with `hermes photon telemetry on` / `hermes photon telemetry off`.")
-        return 0
-    try:
-        from hermes_cli.config import save_env_value
-        save_env_value("PHOTON_TELEMETRY", "true" if state == "on" else "false")
-    except Exception as e:
-        print(f"could not save PHOTON_TELEMETRY: {e}", file=sys.stderr)
-        return 1
-    print(f"✓ Spectrum telemetry turned {state} (PHOTON_TELEMETRY in ~/.hermes/.env)")
-    print("  Restart the gateway for the sidecar to pick it up:  hermes gateway restart")
-    return 0
-
-
-def _install_sidecar() -> int:
-    import pm
-
-    try:
-        npm = find_node_executable("npm")
-        env = with_hermes_node_path()
-        if npm is None:
-            env = pm.ensure("npm", explicit=True).env
-            installed = pm.installed_package("npm")
-            if installed is None or installed.binary is None:
-                raise pm.InstallError("npm", "ensured but no selected binary was recorded")
-            npm = str(installed.binary)
-    except pm.InstallError as exc:
-        print(f"Could not prepare Photon dependencies: {exc}", file=sys.stderr)
-        return 1
-    # spectrum-ts is pinned exactly (the SDK ships breaking majors); upgrades are deliberate —
-    # never `@latest` (see README "Upgrading spectrum-ts"). `npm ci` installs the lockfile
-    # verbatim; `npm install` is the fallback for a missing/drifted lockfile.
-    print(f"  $ cd {_sidecar_dir()} && {npm} ci")
-
-    def _run(verb: str) -> subprocess.CompletedProcess:
-        # stdout streams to the terminal; stderr is captured so the failure reason can be
-        # persisted for check_requirements() to surface later.
-        proc = subprocess.run(
-            [npm, verb], stdin=subprocess.DEVNULL, cwd=str(_sidecar_dir()), check=False, stderr=subprocess.PIPE, text=True, env=env)
-        if proc.stderr:
-            print(proc.stderr, end="", file=sys.stderr)
-        return proc
-    proc = _run("ci")
-    if proc.returncode != 0:
-        print(f"  npm ci failed — falling back to:  {npm} install")
-        proc = _run("install")
-    error = (proc.stderr or "").strip()[:_NPM_ERROR_LOG_MAX_CHARS]  # bounded to what check_requirements surfaces
-    if proc.returncode != 0:
-        print("npm install failed", file=sys.stderr)
-    with contextlib.suppress(OSError):
-        if proc.returncode == 0:
-            _npm_error_log().unlink()
-        elif error:
-            _npm_error_log().write_text(error, encoding="utf-8")
-    return proc.returncode
-
-
-_COMMANDS = {
-    "setup": _cmd_setup, "status": _cmd_status, "install-sidecar": lambda _args: _install_sidecar(),
-    "telemetry": _cmd_telemetry}
+_COMMANDS = {"setup": _cmd_setup, "status": _cmd_status}
 
 
 def gateway_setup() -> None:
@@ -388,7 +310,7 @@ def gateway_setup() -> None:
     as ``hermes photon setup``; phone is prompted when stdin is a TTY)."""
     _cmd_setup(argparse.Namespace(
         photon_command="setup", project_name=None, phone=None, first_name=None, last_name=None,
-        email=None, no_browser=False, skip_sidecar_install=False))
+        email=None, no_browser=False))
 
 
 def _prompt(prompt: str, *, secret: bool = False) -> str:

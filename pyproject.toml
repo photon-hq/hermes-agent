@@ -278,8 +278,9 @@ messaging = [
 ] # aiohttp 3.14.5: prior CVEs + GHSA-9xw5-w5jj-pvcg/GHSA-2g87-pp6c-29x5/GHSA-5wr8-gcqf-gqf3 family
 cron = [] # croniter is now a core dependency; this extra kept for back-compat
 slack = ["slack-bolt==1.30.0", "slack-sdk==3.45.0", "aiohttp==3.14.5"]
-# Photon 2.0 (iMessage): Photon's own API client, used by `hermes photon setup`.
-photon = ["photonhq-api==0.6.0"]
+# Photon 2.0 (iMessage): Photon's API client (setup and REST sends) and the Socket.IO client the
+# gateway receives events on.
+photon = ["photonhq-api==0.6.0", "python-socketio[asyncio_client]==5.17.0", "aiohttp==3.14.5"]
 # Matrix gateway deps. `mautrix[encryption]` pulls `python-olm`, whose
 # vendored libolm (archived 2023) cannot build on Windows or modern macOS:
 # no wheels for those targets AND the sdist fails to compile on current
@@ -834,4 +835,3 @@ select = ["PLW1514", "ASYNC210", "ASYNC220", "ASYNC221", "ASYNC251", "TID251"]
 "hermes_cli/web_routers/profiles.py" = ["ASYNC220", "ASYNC221"]
 # Legacy blocking spawn sites in platform adapters, pending their own fixes.
 "plugins/platforms/whatsapp/adapter.py" = ["ASYNC220", "ASYNC221"]
-"plugins/platforms/photon/adapter.py" = ["ASYNC220"]

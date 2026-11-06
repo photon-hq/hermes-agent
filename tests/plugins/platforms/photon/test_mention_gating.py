@@ -1,51 +1,28 @@
-"""Group-chat mention-gating tests for PhotonAdapter.
+"""Group-chat mention gating: parity with the BlueBubbles iMessage channel.
 
-Parity with the BlueBubbles iMessage channel: when ``require_mention`` is
-enabled, group messages are dropped unless they hit a wake-word pattern,
-and the leading wake word is stripped from the ones that pass. DMs are
-never gated.
-
-These call ``_dispatch_inbound`` directly (no aiohttp / ports) and assert
-on what reaches ``handle_message``.
+With ``require_mention`` on, a group message is dropped unless it hits a wake-word pattern, and the
+leading wake word is stripped from the ones that pass. Direct conversations are never gated. A
+shared Beta line only serves direct spaces, so this matters for dedicated lines.
 """
 from __future__ import annotations
 
-from typing import List
-
+import httpx
 import pytest
 
 from gateway.config import PlatformConfig
 from gateway.platforms.event import MessageEvent
+from plugins.platforms.photon import adapter as photon_adapter
 from plugins.platforms.photon.adapter import PhotonAdapter
+from tests.plugins.platforms.photon.conftest import FakePhotonApi
+
+P = f"/v1/projects/{FakePhotonApi.PROJECT_ID}"
+ATTACHMENT_ID = "pho_att_00000000000000000000000001"
 
 
-def _make_adapter(monkeypatch: pytest.MonkeyPatch, extra: dict | None = None) -> PhotonAdapter:
-    monkeypatch.setenv("PHOTON_PROJECT_ID", "test-project-id")
-    monkeypatch.setenv("PHOTON_PROJECT_SECRET", "test-project-secret")
-    monkeypatch.delenv("PHOTON_REQUIRE_MENTION", raising=False)
-    monkeypatch.delenv("PHOTON_MENTION_PATTERNS", raising=False)
-    cfg = PlatformConfig(enabled=True, token="", extra=extra or {})
-    return PhotonAdapter(cfg)
-
-
-def _group_payload(text: str) -> dict:
-    return {
-        "messageId": f"grp-{abs(hash(text))}",
-        "space": {"id": "group-guid-xyz", "type": "group", "phone": None},
-        "sender": {"id": "+15551234567"},
-        "content": {"type": "text", "text": text},
-        "timestamp": "2026-05-14T19:06:32.000Z",
-    }
-
-
-def _dm_payload(text: str) -> dict:
-    return {
-        "messageId": f"dm-{abs(hash(text))}",
-        "space": {"id": "+15551234567", "type": "dm", "phone": "+15551234567"},
-        "sender": {"id": "+15551234567"},
-        "content": {"type": "text", "text": text},
-        "timestamp": "2026-05-14T19:06:32.000Z",
-    }
+def _adapter(extra: dict | None = None) -> PhotonAdapter:
+    adapter = PhotonAdapter(PlatformConfig(enabled=True, extra=extra or {}))
+    adapter._api = photon_adapter._PhotonApi(FakePhotonApi.PROJECT_ID, FakePhotonApi.API_KEY)
+    return adapter
 
 
 def _capture(adapter: PhotonAdapter, monkeypatch: pytest.MonkeyPatch) -> list[MessageEvent]:
@@ -58,86 +35,103 @@ def _capture(adapter: PhotonAdapter, monkeypatch: pytest.MonkeyPatch) -> list[Me
     return captured
 
 
+def _text(text: str, *, kind: str = "group", message_id: str = FakePhotonApi.MESSAGE_ID) -> dict:
+    return FakePhotonApi.event(FakePhotonApi.message(
+        {"type": "text", "format": "plain", "text": text}, kind=kind, message_id=message_id))
+
+
+@pytest.fixture
+def api(photon_async_api: FakePhotonApi, monkeypatch: pytest.MonkeyPatch) -> FakePhotonApi:
+    monkeypatch.setenv("PHOTON_READ_RECEIPTS", "false")
+    return photon_async_api
 
 
 @pytest.mark.asyncio
-async def test_group_message_dropped_without_mention(monkeypatch: pytest.MonkeyPatch) -> None:
-    adapter = _make_adapter(monkeypatch, extra={"require_mention": True})
+async def test_group_message_dropped_without_mention(api, monkeypatch):
+    adapter = _adapter({"require_mention": True})
     captured = _capture(adapter, monkeypatch)
 
-    await adapter._dispatch_inbound(_group_payload("just chatting, no wake word"))
+    await adapter._dispatch_event(_text("just chatting, no wake word"))
+
     assert captured == []
 
 
 @pytest.mark.asyncio
-async def test_dm_never_gated(monkeypatch: pytest.MonkeyPatch) -> None:
-    adapter = _make_adapter(monkeypatch, extra={"require_mention": True})
+async def test_group_message_with_mention_passes_without_the_wake_word(api, monkeypatch):
+    adapter = _adapter({"require_mention": True})
     captured = _capture(adapter, monkeypatch)
 
-    await adapter._dispatch_inbound(_dm_payload("no wake word here"))
-    assert len(captured) == 1
-    assert captured[0].text == "no wake word here"
+    await adapter._dispatch_event(_text("hermes, what's the weather"))
+
+    [event] = captured
+    assert event.text == "what's the weather"
+    assert event.source.chat_type == "group"
 
 
-def test_custom_mention_patterns_from_config(monkeypatch: pytest.MonkeyPatch) -> None:
-    adapter = _make_adapter(
-        monkeypatch,
-        extra={"require_mention": True, "mention_patterns": [r"(?<![\w@])@?amos\b[,:\-]?"]},
-    )
+@pytest.mark.asyncio
+async def test_group_message_passes_when_gating_is_off(api, monkeypatch):
+    adapter = _adapter()
+    captured = _capture(adapter, monkeypatch)
+
+    await adapter._dispatch_event(_text("hermes, what's the weather"))
+
+    assert captured[0].text == "hermes, what's the weather"  # only a gated message is cleaned
+
+
+@pytest.mark.asyncio
+async def test_dm_never_gated(api, monkeypatch):
+    adapter = _adapter({"require_mention": True})
+    captured = _capture(adapter, monkeypatch)
+
+    await adapter._dispatch_event(_text("no wake word here", kind="direct"))
+
+    [event] = captured
+    assert (event.text, event.source.chat_type) == ("no wake word here", "dm")
+
+
+def test_custom_mention_patterns_from_config(api):
+    adapter = _adapter({"require_mention": True, "mention_patterns": [r"(?<![\w@])@?amos\b[,:\-]?"]})
+
     assert adapter.require_mention is True
     assert len(adapter._mention_patterns) == 1
     assert adapter._message_matches_mention_patterns("amos help me") is True
     assert adapter._message_matches_mention_patterns("hermes help me") is False
 
 
-def test_mention_patterns_env_comma_separated(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("PHOTON_PROJECT_ID", "test-project-id")
-    monkeypatch.setenv("PHOTON_PROJECT_SECRET", "test-project-secret")
+def test_mention_settings_from_env(api, monkeypatch):
     monkeypatch.setenv("PHOTON_REQUIRE_MENTION", "true")
     monkeypatch.setenv("PHOTON_MENTION_PATTERNS", r"bot\b, assistant\b")
-    cfg = PlatformConfig(enabled=True, token="", extra={})
-    adapter = PhotonAdapter(cfg)
+
+    adapter = _adapter()
+
     assert adapter.require_mention is True
     assert len(adapter._mention_patterns) == 2
     assert adapter._message_matches_mention_patterns("hey bot") is True
 
 
-def test_invalid_pattern_skipped(monkeypatch: pytest.MonkeyPatch) -> None:
-    adapter = _make_adapter(
-        monkeypatch,
-        extra={"require_mention": True, "mention_patterns": ["(unclosed", r"good\b"]},
-    )
-    # Bad regex dropped, good one kept.
+def test_invalid_pattern_skipped(api):
+    adapter = _adapter({"require_mention": True, "mention_patterns": ["(unclosed", r"good\b"]})
+
     assert len(adapter._mention_patterns) == 1
     assert adapter._message_matches_mention_patterns("a good thing") is True
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("caption, cached_calls, dispatched", [
-    ("holiday pic", 0, 0),          # unmentioned group attachment: never persisted
-    ("hermes holiday pic", 1, 1),   # mentioned: cached and dispatched
-])
-async def test_unmentioned_group_attachment_is_not_cached(
-        monkeypatch: pytest.MonkeyPatch, caption: str, cached_calls: int, dispatched: int) -> None:
-    """The group mention gate must run BEFORE inline attachment bytes hit the media cache."""
-    import plugins.platforms.photon.adapter as photon_adapter
-
-    adapter = _make_adapter(monkeypatch, extra={"require_mention": True})
+@pytest.mark.parametrize("caption, downloads, dispatched", [
+    ("holiday pic", 0, 0),
+    ("hermes holiday pic", 1, 1),
+], ids=["unmentioned", "mentioned"])
+async def test_the_gate_runs_before_attachments_are_downloaded(api, monkeypatch, caption, downloads, dispatched):
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+    api.on("GET", f"{P}/attachments/{ATTACHMENT_ID}", api.attachment(ATTACHMENT_ID, size=len(png)))
+    api.on("GET", f"{P}/attachments/{ATTACHMENT_ID}/content",
+           lambda request: httpx.Response(200, content=png, headers={"content-type": "image/png"}))
+    adapter = _adapter({"require_mention": True})
     captured = _capture(adapter, monkeypatch)
-    calls: list[str] = []
 
-    def fake_cache(content, name, mime, *, force_audio=False):
-        calls.append(name)
-        return "/tmp/cached.png"
+    await adapter._dispatch_event(FakePhotonApi.event(FakePhotonApi.message({"type": "group", "parts": [
+        {"type": "text", "format": "plain", "text": caption},
+        {"type": "attachment", "attachmentId": ATTACHMENT_ID}]}, kind="group")))
 
-    monkeypatch.setattr(photon_adapter, "_cache_inbound_attachment", fake_cache)
-    payload = _group_payload(caption)
-    payload["content"] = {"type": "group", "items": [
-        {"content": {"type": "text", "text": caption}},
-        {"content": {"type": "attachment", "name": "pic.png", "mimeType": "image/png",
-                     "data": "aGVsbG8=", "encoding": "base64"}},
-    ]}
-
-    await adapter._dispatch_inbound(payload)
-    assert len(calls) == cached_calls
+    assert len(api.calls("GET", f"{P}/attachments/{ATTACHMENT_ID}")) == downloads
     assert len(captured) == dispatched

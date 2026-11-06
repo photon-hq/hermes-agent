@@ -1724,7 +1724,7 @@ class GatewayAdapterLifecycleMixin(GatewaySecondaryReconnectMixin):
         candidates = [
             (adapter, attr) for attr in (
                 "token", "bot_token", "_token", "api_token", "_bot_token",
-                "_project_secret",  # Photon/Spectrum: project credentials, not a bot token
+                "_project_api_key",  # Photon: the project API key (pho_sk_…), not a bot token
                 "_app_id",  # Feishu/Lark app_id — stable, log-safe, already the _app_lock_identity
                 "_client_id", "_bot_id",  # Teams / WeCom app-style id pairs
             )

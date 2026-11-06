@@ -256,8 +256,7 @@ paths used by s6 and the privilege-drop shim.
 
 The Docker frontend stage owns pnpm workspace dependencies and compilation. The
 runtime stage copies only the frontend products and the locked TypeScript package for
-runtime linting. Node/npm and Photon's separately installed sidecar dependencies
-remain runtime inputs. Python dependency preparation precedes the application
+runtime linting. Node/npm remain runtime inputs. Python dependency preparation precedes the application
 source copy. Actual cache-hit and layer-size claims require build evidence.
 
 Nix retains `fetchPnpmDeps`, uv2nix, platform overrides, and store references.
