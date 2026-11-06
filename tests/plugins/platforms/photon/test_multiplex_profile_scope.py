@@ -19,7 +19,7 @@ from plugins.platforms.photon.adapter import PhotonAdapter
 
 _PHOTON_ENV = (
     "PHOTON_PROJECT_ID", "PHOTON_API_KEY", "PHOTON_PROJECT_SECRET", "PHOTON_REQUIRE_MENTION",
-    "PHOTON_MARKDOWN", "PHOTON_READ_RECEIPTS", "PHOTON_HOME_CHANNEL", "PHOTON_HOME_CHANNEL_NAME",
+    "PHOTON_MARKDOWN", "PHOTON_READ_RECEIPTS", "PHOTON_HOME_CHANNEL", "PHOTON_HOME_CHANNEL_NAME", "PHOTON_API_HOST",
 )
 
 
@@ -67,6 +67,7 @@ def default_profile_env(monkeypatch):
     monkeypatch.setenv("PHOTON_MARKDOWN", "false")
     monkeypatch.setenv("PHOTON_READ_RECEIPTS", "false")
     monkeypatch.setenv("PHOTON_HOME_CHANNEL", "+15551234567")
+    monkeypatch.setenv("PHOTON_API_HOST", "https://default-profile.invalid")
 
 
 def test_scoped_miss_does_not_borrow_the_default_profile(tmp_hermes_home, multiplex_scope, default_profile_env):
@@ -83,14 +84,17 @@ def test_scoped_miss_does_not_borrow_the_default_profile(tmp_hermes_home, multip
     assert adapter.require_mention is False
     assert photon_adapter._markdown_enabled() is True
     assert photon_adapter._env_flag("PHOTON_READ_RECEIPTS", "true") is True
+    assert photon_auth._api_host() == photon_auth.DEFAULT_API_HOST
 
 
 def test_secondary_profile_runs_on_its_own_credentials(tmp_hermes_home, multiplex_scope, default_profile_env):
-    multiplex_scope({"PHOTON_PROJECT_ID": "pho_prj_profile", "PHOTON_API_KEY": "pho_sk_profile"})
+    multiplex_scope({"PHOTON_PROJECT_ID": "pho_prj_profile", "PHOTON_API_KEY": "pho_sk_profile",
+                     "PHOTON_API_HOST": "https://profile.invalid/"})
 
     adapter = PhotonAdapter(PlatformConfig(enabled=True, extra={}))
 
     assert (adapter._project_id, adapter._project_api_key) == ("pho_prj_profile", "pho_sk_profile")
+    assert photon_auth._api_host() == "https://profile.invalid"
     assert photon_adapter._env_enablement()["project_id"] == "pho_prj_profile"
 
 

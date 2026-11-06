@@ -74,6 +74,21 @@ async def test_the_conversation_becomes_a_send_route(photon_async_api, monkeypat
 
 
 @pytest.mark.asyncio
+async def test_a_group_message_never_becomes_its_senders_phone_route(photon_async_api, monkeypatch):
+    _read_ack(photon_async_api)
+    photon_async_api.on("GET", f"{P}/messages", {"items": []})
+    adapter = _adapter()
+    _capture(adapter, monkeypatch)
+
+    await adapter._dispatch_event(FakePhotonApi.event(FakePhotonApi.message(kind="group")))
+
+    expected = photon_adapter._Route(FakePhotonApi.SPACE_ID, FakePhotonApi.AGENT_ID)
+    assert await adapter._api.route(FakePhotonApi.SPACE_ID) == expected
+    with pytest.raises(LookupError):
+        await adapter._api.route(FakePhotonApi.PHONE)
+
+
+@pytest.mark.asyncio
 async def test_read_receipts_can_be_turned_off(photon_async_api, monkeypatch):
     monkeypatch.setenv("PHOTON_READ_RECEIPTS", "false")
     adapter = _adapter()
