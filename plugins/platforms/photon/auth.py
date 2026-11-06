@@ -440,17 +440,20 @@ def archive_legacy_credentials() -> bool:
     where Photon's migration tool can pick them up. True when anything was archived."""
     if not has_legacy_credentials():
         return False
-    spectrum_id, secret = load_project_credentials()
-    if spectrum_id and spectrum_id.startswith(PROJECT_ID_PREFIX):
-        spectrum_id = None
+    env_id = _get_scoped_secret("PHOTON_PROJECT_ID")
+    entry = _pool_first(_load_auth(), "photon_project") or {}
+    # A Photon 2.0 id already in PHOTON_PROJECT_ID must not hide the Spectrum id kept in auth.json.
+    spectrum_id = next((str(v) for v in (env_id, entry.get("spectrum_project_id"), entry.get("project_id"))
+                        if v and not str(v).startswith(PROJECT_ID_PREFIX)), None)
+    secret = _get_scoped_secret("PHOTON_PROJECT_SECRET") or entry.get("project_secret")
     record: dict[str, Any] = {"archived_at": _now()}
     record.update({k: v for k, v in (("spectrum_project_id", spectrum_id), ("project_secret", secret)) if v})
     _store_pool_record("photon_legacy", record)
-    if (_pool_first(_load_auth(), "photon_project") or {}).get("project_secret"):
+    if entry.get("project_secret"):
         _store_pool_record("photon_project", None)
     from hermes_cli.config import remove_env_value
     remove_env_value("PHOTON_PROJECT_SECRET")
-    if spectrum_id:
+    if env_id and not env_id.startswith(PROJECT_ID_PREFIX):
         remove_env_value("PHOTON_PROJECT_ID")
     return True
 

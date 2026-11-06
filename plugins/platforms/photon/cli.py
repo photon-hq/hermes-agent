@@ -18,7 +18,7 @@ from typing import Callable, Optional
 from hermes_cli.colors import Colors, color
 
 from . import auth as photon_auth
-from hermes_constants import find_node_executable, with_hermes_node_path
+from hermes_constants import display_hermes_home, find_node_executable, with_hermes_node_path
 from .sidecar_paths import _NPM_ERROR_LOG_MAX_CHARS, _npm_error_log, _sidecar_dir
 
 
@@ -142,7 +142,7 @@ def _setup_project(args: argparse.Namespace, account: Callable[[], str]) -> tupl
     photon_auth.store_project_credentials(
         project_id=project_id, api_key=api_key, organization_id=organization_id,
         api_key_id=api_key_id, name=name)
-    print("  ✓ API key saved (PHOTON_PROJECT_ID + PHOTON_API_KEY in ~/.hermes/.env)\n"
+    print(f"  ✓ API key saved (PHOTON_PROJECT_ID + PHOTON_API_KEY in {display_hermes_home()}/.env)\n"
           "  ⚠ If the gateway is running, restart it to pick up the new key:  hermes gateway restart")
     return project_id, api_key
 

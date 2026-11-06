@@ -115,6 +115,21 @@ def test_spectrum_credentials_move_out_of_the_runtime_slots(photon_home) -> None
     assert photon_auth.archive_legacy_credentials() is False
 
 
+def test_photon_2_project_id_in_env_keeps_the_spectrum_pairing(photon_home, monkeypatch) -> None:
+    """Photon 2.0 credentials set by hand on a Spectrum home: the Spectrum id still comes from
+    auth.json, and the hand-set Photon 2.0 id stays in place."""
+    monkeypatch.setenv("PHOTON_PROJECT_ID", PROJECT_ID)
+    monkeypatch.setenv("PHOTON_API_KEY", "pho_sk_live")
+    photon_auth._store_pool_record("photon_project", {
+        "spectrum_project_id": "8f3c-spectrum", "project_secret": "spectrum-secret"})
+
+    assert photon_auth.archive_legacy_credentials() is True
+
+    legacy = _pool("photon_legacy")[0]
+    assert (legacy["spectrum_project_id"], legacy["project_secret"]) == ("8f3c-spectrum", "spectrum-secret")
+    assert photon_auth.load_runtime_credentials() == (PROJECT_ID, "pho_sk_live")
+
+
 # -- Projects and keys ----------------------------------------------------------------
 
 def test_find_project_by_name_follows_pages(photon_api) -> None:
