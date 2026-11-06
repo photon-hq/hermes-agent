@@ -51,9 +51,10 @@ DEFAULT_API_HOST = "https://api.photon.codes"
 DASHBOARD_URL = "https://app.beta.photon.codes"
 DEFAULT_PROJECT_NAME = "Hermes Agent"
 PROJECT_ID_PREFIX = "pho_prj_"
-# What the gateway needs: the event stream, message history and sends (events, project), and
-# the line mode + assignments for setup and status (platforms). Seats stay with the account.
-PROJECT_KEY_PERMISSIONS = ["project:read", "project:write", "events:read", "platforms:read"]
+# What the gateway needs: the event socket and message history (project:read), sends and
+# uploads (project:write), and the line mode + assignments for setup and status
+# (platforms:read). Seats stay with the account.
+PROJECT_KEY_PERMISSIONS = ["project:read", "project:write", "platforms:read"]
 DEVICE_CODE_GRANT = "urn:ietf:params:oauth:grant-type:device_code"
 DEFAULT_POLL_INTERVAL = 5  # RFC 8628 default; Photon's `interval` wins
 E164_RE = re.compile(r"^\+[1-9]\d{6,14}$")
