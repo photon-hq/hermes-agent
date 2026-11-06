@@ -124,6 +124,7 @@ def test_lazy_installable_extras_excluded_from_all():
         "google-chat",
         "keychain",  # keyring — vault key in the OS keychain, installed by `hermes vault key migrate`
         "mistral",  # mistralai — Voxtral STT/TTS, lazy-installed (stt.mistral / tts.mistral)
+        "photon",  # photonhq-api — Photon 2.0 iMessage, lazy-installed by `hermes photon setup`
     }
     all_extra_specs = optional_dependencies["all"]
     for extra in lazy_covered_extras:
