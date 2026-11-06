@@ -1,9 +1,10 @@
-"""Photon 2.0 API served in-process for the setup tests.
+"""Photon 2.0 API served in-process for the setup and gateway tests.
 
-The ``photon_api`` fixture patches the real ``photon_api.Photon`` client the plugin builds so
-its requests go through an ``httpx.MockTransport``: the SDK still builds and validates every
-request and response, only the network is replaced. The reply builders satisfy the SDK's
-response models, so schema drift in a new SDK pin fails here rather than in production.
+The ``photon_api`` fixture patches the real ``photon_api.Photon`` client setup builds, and
+``photon_async_api`` the ``AsyncPhoton`` client the adapter builds, so their requests go
+through an ``httpx.MockTransport``: the SDK still builds and validates every request and
+response, only the network is replaced. The reply builders satisfy the SDK's response models, so
+schema drift in a new SDK pin fails here rather than in production.
 """
 from __future__ import annotations
 
@@ -18,7 +19,8 @@ from plugins.platforms.photon import auth as photon_auth
 
 _PHOTON_ENV = (
     "PHOTON_PROJECT_ID", "PHOTON_API_KEY", "PHOTON_PROJECT_SECRET", "PHOTON_API_HOST",
-    "PHOTON_ALLOWED_USERS", "PHOTON_HOME_CHANNEL",
+    "PHOTON_ALLOWED_USERS", "PHOTON_HOME_CHANNEL", "PHOTON_MARKDOWN", "PHOTON_READ_RECEIPTS",
+    "PHOTON_REQUIRE_MENTION", "PHOTON_MENTION_PATTERNS",
 )
 
 Reply = dict | tuple | Callable[[httpx.Request], httpx.Response]
@@ -31,6 +33,13 @@ class FakePhotonApi:
     NOW = "2026-11-01T00:00:00.000Z"
     ORG_ID = "pho_org_00000000000000000000000001"
     PROJECT_ID = "pho_prj_00000000000000000000000001"
+    API_KEY = "pho_sk_test"
+    SPACE_ID = "pho_spc_00000000000000000000000001"
+    PERSON_ID = "pho_usr_00000000000000000000000001"
+    AGENT_ID = "pho_usr_00000000000000000000000002"
+    MESSAGE_ID = "pho_msg_00000000000000000000000001"
+    PHONE = "+15551234567"
+    LINE = "+16282679185"
 
     def __init__(self) -> None:
         self.routes: dict[tuple[str, str], list[Reply]] = {}
@@ -106,6 +115,43 @@ class FakePhotonApi:
                           "projectId": project_id},
                 "status": "received", "timestamps": {"receivedAt": cls.NOW}, "updatedAt": cls.NOW}
 
+    @classmethod
+    def user(cls, user_id: str, handle: str, kind: str) -> dict:
+        return {"details": {"type": "shared"} if kind == "agent" else {}, "handle": handle, "id": user_id,
+                "kind": kind, "metadata": {}, "platform": "imessage", "projectId": cls.PROJECT_ID}
+
+    @classmethod
+    def message(cls, content: dict | None = None, *, handle: str = PHONE, message_id: str = MESSAGE_ID,
+                status: str = "received", kind: str = "direct", parent: str | None = None) -> dict:
+        """A stored iMessage Message: ``received`` from ``handle`` by the line, or ``dispatched`` to it."""
+        person, agent = cls.user(cls.PERSON_ID, handle, "human"), cls.user(cls.AGENT_ID, cls.LINE, "agent")
+        received = status == "received"
+        message = {
+            "content": content or {"format": "plain", "text": "hi", "type": "text"}, "createdAt": cls.NOW,
+            "id": message_id, "metadata": {}, "platform": "imessage", "projectId": cls.PROJECT_ID,
+            "sentBy": person if received else agent, "receivedBy": agent if received else person,
+            "space": {"details": {}, "id": cls.SPACE_ID, "kind": kind, "metadata": {},
+                      "participantIds": [cls.PERSON_ID, cls.AGENT_ID], "platform": "imessage",
+                      "projectId": cls.PROJECT_ID},
+            "status": status, "updatedAt": cls.NOW,
+            "timestamps": {"receivedAt": cls.NOW} if received else {"dispatchedAt": cls.NOW}}
+        if parent:
+            message["parentMessageId"] = parent
+        return message
+
+    @classmethod
+    def event(cls, message: dict, event_type: str = "message.received") -> dict:
+        """The public event a socket delivery carries (the webhook envelope)."""
+        return {"apiVersion": "2026-07-01", "data": {"object": message, "projectId": cls.PROJECT_ID},
+                "id": "pho_evt_00000000000000000000000001", "source": "imessage.photon", "timestamp": cls.NOW,
+                "type": event_type}
+
+    @classmethod
+    def attachment(cls, attachment_id: str, *, content_type: str = "image/png", size: int = 4,
+                   filename: str = "photo.png") -> dict:
+        return {"contentType": content_type, "createdAt": cls.NOW, "filename": filename, "id": attachment_id,
+                "projectId": cls.PROJECT_ID, "sizeBytes": size, "updatedAt": cls.NOW}
+
 
 @pytest.fixture
 def photon_home(monkeypatch: pytest.MonkeyPatch):
@@ -115,6 +161,20 @@ def photon_home(monkeypatch: pytest.MonkeyPatch):
     yield
     for key in _PHOTON_ENV:
         os.environ.pop(key, None)
+
+
+@pytest.fixture
+def photon_async_api(monkeypatch: pytest.MonkeyPatch, photon_home) -> FakePhotonApi:
+    """The fake API behind the adapter's ``AsyncPhoton`` client, with the gateway's credentials set."""
+    from plugins.platforms.photon import adapter as photon_adapter
+
+    api = FakePhotonApi()
+    client = httpx.AsyncClient(transport=httpx.MockTransport(api.handle))
+    real = photon_adapter.AsyncPhoton
+    monkeypatch.setattr(photon_adapter, "AsyncPhoton", lambda **kw: real(**kw, client=client))
+    monkeypatch.setenv("PHOTON_PROJECT_ID", FakePhotonApi.PROJECT_ID)
+    monkeypatch.setenv("PHOTON_API_KEY", FakePhotonApi.API_KEY)
+    return api
 
 
 @pytest.fixture

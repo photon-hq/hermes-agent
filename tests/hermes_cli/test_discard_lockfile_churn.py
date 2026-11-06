@@ -1,6 +1,6 @@
 """`hermes update` lockfile-churn cleanup reverts only npm's own rewrites (#112378).
 
-The npm projects (``scripts/whatsapp-bridge``, the Photon sidecar) carry their own ``package-lock.json``;
+The npm projects (``scripts/whatsapp-bridge``) carry their own ``package-lock.json``;
 npm rewrites them non-deterministically, so a lock whose sibling manifest is clean is churn. A dirty
 sibling manifest protects its lock. ``pnpm-lock.yaml`` is never rewritten by pnpm's frozen installs:
 a change there is the user's and survives the cleanup.

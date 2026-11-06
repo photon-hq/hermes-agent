@@ -3,7 +3,8 @@ over credential stores (profile export, file tools, gateway media delivery, the 
 backups), at their current location and at the one earlier releases used.
 
 The current paths come from the writers' own path functions, so moving a store without updating the
-guards, or dropping it from one of them, fails here. The stores sit directly in the profile home: a
+guards, or dropping it from one of them, fails here. The Photon sidecar token has no writer since Photon
+2.0 dropped the sidecar; homes set up before it still hold the file, so its path stays guarded. The stores sit directly in the profile home: a
 sandbox that hides files by path can hide them safely only there (a writable folder above a hidden file
 can be renamed).
 """
@@ -31,10 +32,8 @@ def home(tmp_path, monkeypatch):
 def _current(home: Path) -> tuple[str, ...]:
     from agent.secret_sources import bitwarden as bw
     from agent.secret_sources import onepassword as op
-    from plugins.platforms.photon import adapter as photon
-
     paths = (bw._disk_cache_path(home), bw._encrypted_disk_cache_path(home), op._STORE.disk.path(home),
-             photon._runtime_record_path())
+             home / "photon-sidecar.json")
     return tuple(p.relative_to(home).as_posix() for p in paths)
 
 

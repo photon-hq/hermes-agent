@@ -696,7 +696,7 @@ Connect Hermes to a [SimpleX Chat](https://simplex.chat/) network via a local `s
 
 ### Photon
 
-Connect Hermes to [Photon](https://photon.codes/) / Spectrum (iMessage and other Spectrum platforms) via the Node sidecar. See [the Photon messaging guide](../user-guide/messaging/photon.md).
+Connect Hermes to iMessage through [Photon](https://photon.codes/) 2.0. See [the Photon messaging guide](../user-guide/messaging/photon.md).
 
 | Variable | Description |
 |----------|-------------|
@@ -707,14 +707,10 @@ Connect Hermes to [Photon](https://photon.codes/) / Spectrum (iMessage and other
 | `PHOTON_ALLOW_ALL_USERS` | Allow any sender to trigger the bot (dev only — disables allowlist). |
 | `PHOTON_REQUIRE_MENTION` | Ignore group-chat messages unless they match a mention wake word (`true`/`false`, default `false`). |
 | `PHOTON_MENTION_PATTERNS` | Mention wake-word regexes for group chats (JSON list or comma/newline-separated; defaults to Hermes wake words). |
-| `PHOTON_HOME_CHANNEL` | Default Photon target for cron / notification delivery: Spectrum space id, DM GUID, or bare E.164 phone number. |
+| `PHOTON_HOME_CHANNEL` | Default Photon target for cron / notification delivery: a Photon space id (`pho_spc_...`) or the E.164 phone number of someone who has texted your line. |
 | `PHOTON_HOME_CHANNEL_NAME` | Human label for the home channel. |
-| `PHOTON_MARKDOWN` | Send agent replies as markdown — iMessage renders it natively, other Spectrum platforms degrade to plain text (`true`/`false`, default `true`). |
-| `PHOTON_REACTIONS` | Tapback 👀/👍/👎 on messages as processing status and route tapbacks on bot messages to the agent (`true`/`false`, default `false`). |
+| `PHOTON_MARKDOWN` | Send agent replies as markdown, falling back to plain text when Photon refuses it (`true`/`false`, default `true`). |
 | `PHOTON_READ_RECEIPTS` | Mark inbound iMessages read after forwarding to Hermes (`true`/`false`, default `true`). |
-| `PHOTON_TELEMETRY` | Enable Spectrum SDK telemetry in the sidecar (`true`/`false`, default `false`; toggle with `hermes photon telemetry on|off`). |
-| `PHOTON_SIDECAR_PORT` | Loopback port for the Node sidecar control + inbound channel (default `8789`). |
-| `PHOTON_SIDECAR_AUTOSTART` | Spawn the Node sidecar on connect (`true`/`false`, default `true`). |
 | `PHOTON_API_HOST` | Photon API host (default `https://api.photon.codes`). |
 
 ### Buzz (Nostr communities)

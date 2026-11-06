@@ -26,7 +26,7 @@ _ASSIGNMENTS = f"{_PROJECT}/platforms/imessage/assignments"
 
 def _args(**overrides) -> argparse.Namespace:
     values = {"project_name": None, "phone": PHONE, "first_name": None, "last_name": None, "email": None,
-              "no_browser": True, "skip_sidecar_install": False}
+              "no_browser": True}
     return argparse.Namespace(**{**values, **overrides})
 
 
@@ -57,9 +57,25 @@ def test_autoconfigure_access_fills_unset(photon_home) -> None:
     assert get_env_value("PHOTON_HOME_CHANNEL") == PHONE
 
 
+@pytest.mark.parametrize("home, kept", [
+    ("pho_spc_00000000000000000000000001", True),
+    ("+15559876543", True),
+    ("any;-;+15559876543", False),
+    ("iMessage;+;chat527148912345", False),
+], ids=["space-id", "phone", "spectrum-dm-guid", "spectrum-group-guid"])
+def test_autoconfigure_access_replaces_only_a_spectrum_home_channel(photon_home, home, kept) -> None:
+    save_env_value("PHOTON_ALLOWED_USERS", "+15559876543")
+    save_env_value("PHOTON_HOME_CHANNEL", home)
+
+    cli._autoconfigure_access(PHONE)
+
+    assert get_env_value("PHOTON_ALLOWED_USERS") == "+15559876543"
+    assert get_env_value("PHOTON_HOME_CHANNEL") == (home if kept else PHONE)
+
+
 def test_env_enablement_seeds_home_channel(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("PHOTON_PROJECT_ID", "project_123")
-    monkeypatch.setenv("PHOTON_PROJECT_SECRET", "secret_123")
+    monkeypatch.setenv("PHOTON_PROJECT_ID", PROJECT_ID)
+    monkeypatch.setenv("PHOTON_API_KEY", "pho_sk_test")
     monkeypatch.setenv("PHOTON_HOME_CHANNEL", PHONE)
     monkeypatch.setenv("PHOTON_HOME_CHANNEL_NAME", "Primary DM")
 

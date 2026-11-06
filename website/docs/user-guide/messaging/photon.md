@@ -4,7 +4,7 @@ sidebar_position: 18
 
 # Photon iMessage
 
-Connect Hermes to **iMessage** through [Photon][photon], a managed
+Connect Hermes to **iMessage** through [Photon][photon] 2.0, a managed
 service that handles the Apple line allocation and abuse-prevention
 layer so you don't have to run your own Mac relay.
 
@@ -23,27 +23,23 @@ your account.
 ## Architecture
 
 Photon is a **persistent-connection** channel, like Discord or Slack —
-**no webhook, no public URL, no signing secret to manage.**
+**no webhook, no public URL, no signing secret to manage.** Everything runs
+inside the gateway's Python process:
 
-The `spectrum-ts` SDK holds a long-lived **gRPC stream** to Photon for
-both directions. Because the SDK is TypeScript-only, Hermes runs it in a
-small supervised **Node sidecar** and talks to it over loopback:
+- **Inbound** — the adapter holds a Socket.IO connection to the project's
+  event stream on `api.photon.codes` and handles each new message in order.
+  It saves its place in the stream after every message, so a dropped
+  connection or a gateway restart picks up exactly where it stopped
+  instead of losing messages.
+- **Outbound** — replies, images, typing indicators and read receipts are
+  calls to Photon's REST API.
 
-- **Inbound** — the sidecar consumes the SDK's `app.messages` gRPC
-  stream and forwards each message to the Python adapter over a loopback
-  `GET /inbound` (NDJSON). The adapter dedupes and dispatches it to the
-  agent, reconnecting automatically if the stream drops.
-- **Outbound** — replies are loopback POSTs to the sidecar, which calls
-  `space.send(...)` on the SDK.
-
-The Python plugin starts, supervises, and shuts down the sidecar
-automatically.
+The Python packages it needs (the `photon` extra) install the first time
+the adapter starts; the Docker image ships with them.
 
 ## Prerequisites
 
 - A Photon 2.0 account — sign up at [app.beta.photon.codes][app]
-- Node.js: Hermes uses its managed Node when available.
-  `hermes pm install node` provisions the pin; the adapter can fall back to PATH.
 - A phone number that can receive iMessage (used to bind your account)
 
 That's it — there is no public URL or tunnel to set up.
@@ -84,10 +80,13 @@ Runtime credentials are written to `~/.hermes/.env` (`PHOTON_PROJECT_ID`,
 the environment, e.g. in Docker). Setup and the gateway use them as they are.
 
 :::note Coming from Photon Spectrum
-Hermes now runs on Photon 2.0. If your Hermes still has a `PHOTON_PROJECT_SECRET` from Photon
-Spectrum, create a Photon 2.0 account at [app.beta.photon.codes][app] and run
-`hermes photon setup`. It keeps your Spectrum credentials in `auth.json` so your Spectrum
-projects can move over once Photon's migration tool ships.
+Hermes now runs on Photon 2.0, and a Hermes still set up for Photon Spectrum
+(a `PHOTON_PROJECT_SECRET` in `.env`) no longer connects. Create a Photon 2.0
+account at [app.beta.photon.codes][app] and run `hermes photon setup`. It keeps
+your Spectrum credentials in `auth.json` so your Spectrum projects can move over
+once Photon's migration tool ships. Conversations have new ids on Photon 2.0, so
+existing iMessage sessions start fresh, and setup points a `PHOTON_HOME_CHANNEL`
+that held a Spectrum chat id at your number.
 :::
 
 ## Authorizing users
@@ -160,7 +159,7 @@ hermes gateway start
 You'll see something like:
 
 ```
-[photon] connected — sidecar on 127.0.0.1:8789, streaming inbound over gRPC
+[photon] connected — streaming project pho_prj_... events after cursor 0
 ```
 
 Send an iMessage to your assigned number and Hermes will reply.
@@ -171,72 +170,47 @@ Send an iMessage to your assigned number and Hermes will reply.
 hermes photon status
 ```
 
-Prints saved credentials, sidecar health, your registered number, and the
-assigned iMessage line Hermes uses. When a Photon token and dashboard project
-are available, `status` refreshes missing number rows from the dashboard
-without provisioning new lines.
-
-```
-Photon iMessage status
-──────────────────────
-  device token        : ✓ stored
-  dashboard project   : 3c90c3cc-0d44-4b50-...
-  spectrum project id : sp-...
-  project secret      : ✓ stored
-  my number           : +15551234567
-  assigned number     : +16282679185
-  node binary         : /usr/bin/node
-  sidecar deps        : ✓ installed
-```
+Prints whether you're signed in to Photon (only setup needs it), the
+project id, whether an API key is stored, your registered number, the
+assigned iMessage line, and — checked live against Photon — whether
+routing works yet, which needs one text from your number to the line.
 
 Common issues:
 
-- **`sidecar deps : ✗ run hermes photon install-sidecar`** — Node is
-  installed but `spectrum-ts` isn't. Run the suggested command.
-- **`device token : ✗ missing`** — run `hermes photon setup` to log in.
-- **`No iMessage line assigned yet`** — Spectrum is enabled but no line
-  has been provisioned; re-run `hermes photon setup` or check the
-  [dashboard][app].
-- **Sidecar won't start** — confirm `node --version` is 18.17+ and that
-  `hermes photon install-sidecar` completed without errors.
+- **`routing : ✗ not live`** — text your assigned line once from your
+  registered number, then re-check.
+- **The gateway reports `AUTH_REJECTED`** — Photon no longer accepts the
+  project API key (revoked, or the project was deleted). Re-run
+  `hermes photon setup`; it replaces the key.
+- **The gateway reports `SPECTRUM_LEGACY`** — this Hermes is still set up
+  for Photon Spectrum; see the note under [First-time setup](#first-time-setup).
+- **The gateway reports `MISSING_DEP`** — the `photon` extra could not be
+  installed (for example, no network). Run `hermes pm install --extra photon`.
 
-## Limits today
+## What works today
 
-- **Inbound attachments are metadata-only.** Inbound events carry the
-  filename + MIME type; the agent sees a marker but can't yet read the
-  bytes. The SDK exposes attachment bytes via `content.read()`, so this
-  is a sidecar follow-up.
-- **Outbound attachments are supported.** Hermes sends images, voice
-  notes, video, and documents through spectrum-ts' `attachment()` /
-  `voice()` content builders via the sidecar's `/send-attachment`
-  endpoint. Captions arrive as a separate iMessage bubble after the
-  media.
-- **Native polls are supported.** Hermes sends poll content through
-  spectrum-ts' `poll()` builder via the sidecar's `/send-poll` endpoint.
-- **Read receipts are supported.** The sidecar marks an inbound iMessage
-  read after forwarding it to Hermes, so the sender sees `Read` without
-  waiting for a model/tool turn. Inbound receipts for Hermes-sent messages
-  are consumed as presence telemetry and never create an agent turn. Set
-  `PHOTON_READ_RECEIPTS=false` to keep messages at `Delivered`.
-- **Message effects are supported.** Hermes sends text with native iMessage
-  bubble/screen effects through spectrum-ts' iMessage `effect()` builder
-  via the sidecar's `/send-effect` endpoint.
-- **Photon's free quotas:** 5,000 messages per server per day,
-  50 new-conversation initiations per shared line per day. Increases
-  available — email `help@photon.codes`.
-- **Cron and standalone sends need the gateway running.** Out-of-process
-  senders (cron jobs, `hermes send`, the dashboard) reuse the sidecar the
-  gateway spawned — they read its port/token from
-  `<hermes-home>/photon-sidecar.json`, written once the sidecar
-  passes its health check and removed when it stops. If a standalone send
-  reports the gateway appears to be down, start (or restart) the gateway
-  first.
-- **Shared/free-tier lines can't initiate conversations with new
-  targets.** Photon-side policy: a shared line can only message a number
-  after that number has texted the line first. A cron/standalone send to a
-  brand-new recipient will be rejected by Photon even when Hermes is set
-  up correctly — either have the recipient message the line once, or move
-  to a dedicated line.
+Photon 2.0 sends **text and images** over iMessage. Concretely:
+
+- **Text** goes out as markdown, which iMessage renders. If Photon refuses a
+  reply's markdown, Hermes resends it as plain text. `PHOTON_MARKDOWN=false`
+  always sends plain text.
+- **Inbound attachments are downloaded.** Images, files and voice notes reach
+  the agent as real media (up to 64 MB each); anything larger arrives as a
+  short text marker so the agent still knows something came in.
+- **Outbound images** are sent natively, with an optional caption. Other
+  files, video and voice notes can't be sent on Photon 2.0 yet.
+- **Threaded replies** to one of Hermes's messages reach the agent with the
+  quoted text.
+- **Typing indicator and read receipts.** Set `PHOTON_READ_RECEIPTS=false` to
+  keep messages at `Delivered`.
+- **Not yet on Photon 2.0:** tapbacks, polls and message effects.
+- **A shared line works in direct conversations only**, and only with people
+  who have texted it since their line was assigned. Group chats get no
+  replies on a shared line, and a cron or standalone send to someone who has
+  never texted the line fails with that reason.
+- **Cron and standalone sends don't need the gateway running.** They call
+  Photon directly with the same credentials. The target is a phone number of
+  someone who has texted the line, or a Photon space id (`pho_spc_...`).
 
 ## Env vars
 
@@ -244,12 +218,12 @@ Common issues:
 |---------------------------|--------------------|--------------------------------------------|
 | `PHOTON_PROJECT_ID`       | from `.env`        | Photon 2.0 project id (`pho_prj_...`); set by setup |
 | `PHOTON_API_KEY`          | from `.env`        | Project API key (`pho_sk_...`); set by setup |
-| `PHOTON_SIDECAR_PORT`     | `8789`             | Loopback port for the sidecar control + inbound channel |
-| `PHOTON_SIDECAR_AUTOSTART`| `true`             | Whether the adapter spawns the sidecar     |
-| `PHOTON_HOME_CHANNEL`     | (unset)            | Default space id for cron / notifications  |
+| `PHOTON_HOME_CHANNEL`     | your number        | Default target for cron / notifications: a phone number that has texted the line, or a space id |
 | `PHOTON_HOME_CHANNEL_NAME`| (unset)            | Human label for the home channel           |
-| `PHOTON_ALLOWED_USERS`    | (unset)            | Comma-separated E.164 allowlist            |
+| `PHOTON_ALLOWED_USERS`    | your number        | Comma-separated E.164 allowlist            |
 | `PHOTON_ALLOW_ALL_USERS`  | `false`            | Dev only — accept any sender               |
+| `PHOTON_READ_RECEIPTS`    | `true`             | Mark inbound messages read once Hermes has them |
+| `PHOTON_MARKDOWN`         | `true`             | Send replies as markdown; `false` sends plain text |
 | `PHOTON_REQUIRE_MENTION`  | `false`            | Require a wake word before responding in groups |
 | `PHOTON_MENTION_PATTERNS` | Hermes wake words  | JSON list / comma / newline regex patterns for group mentions |
 | `PHOTON_API_HOST`         | `api.photon.codes` | Override the Photon API host               |

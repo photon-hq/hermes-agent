@@ -39,21 +39,21 @@ class TestCredentialFingerprint:
         assert GatewayRunner._adapter_listener_claim(Platform("photon"), photon) is None
 
 
-    def test_reads_photon_project_secret(self):
+    def test_reads_photon_project_api_key(self):
         class _PhotonAdapter:
-            def __init__(self, secret):
-                self._project_secret = secret
+            def __init__(self, api_key):
+                self._project_api_key = api_key
 
         fp1 = GatewayRunner._adapter_credential_fingerprint(
-            _PhotonAdapter("shared-project-secret")
+            _PhotonAdapter("pho_sk_shared")
         )
         fp2 = GatewayRunner._adapter_credential_fingerprint(
-            _PhotonAdapter("shared-project-secret")
+            _PhotonAdapter("pho_sk_shared")
         )
 
         assert fp1 == fp2
         assert fp1 is not None
-        assert "shared-project-secret" not in fp1
+        assert "pho_sk_shared" not in fp1
 
     def test_reads_feishu_app_id(self):
         """Feishu/Lark authenticates via app_id/app_secret, not a token.

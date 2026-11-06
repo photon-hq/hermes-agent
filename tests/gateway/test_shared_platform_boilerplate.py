@@ -42,7 +42,8 @@ def test_env_enablement_reads_only_through_scoped_getter(plugin, monkeypatch):
         "IRC_SERVER": "irc.example", "IRC_CHANNEL": "#h", "IRC_PORT": "6697",
         "LINE_CHANNEL_ACCESS_TOKEN": "t", "LINE_CHANNEL_SECRET": "s", "LINE_PORT": "8081",
         "NTFY_TOPIC": "topic", "NTFY_TOKEN": "tok",
-        "PHOTON_PROJECT_ID": "pid", "PHOTON_PROJECT_SECRET": "sec", "PHOTON_HOME_CHANNEL": "line-1",
+        "PHOTON_PROJECT_ID": "pho_prj_00000000000000000000000001", "PHOTON_API_KEY": "pho_sk_k",
+        "PHOTON_HOME_CHANNEL": "+15551234567",
         "SIMPLEX_WS_URL": "ws://x", "SIMPLEX_GROUP_ALLOWED": "g",
         "TEAMS_CLIENT_ID": "c", "TEAMS_CLIENT_SECRET": "s", "TEAMS_TENANT_ID": "t", "TEAMS_PORT": "3979",
     }
