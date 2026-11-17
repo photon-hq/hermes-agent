@@ -152,6 +152,13 @@ Both keys also accept env vars (`PHOTON_REQUIRE_MENTION`,
 `PHOTON_MENTION_PATTERNS`). This is the same mention-gating model the
 BlueBubbles iMessage channel uses.
 
+A group voice note has no text, so it can't match a wake word. Set
+`voice_mention_patterns: true` beside `require_mention` to transcribe it
+first and match the patterns against what was said. It is off by default,
+because every unaddressed voice note in the group then goes to your
+speech-to-text provider. The turn reuses that transcript, so a note that
+wakes Hermes is transcribed once.
+
 ## Start the gateway
 
 ```bash

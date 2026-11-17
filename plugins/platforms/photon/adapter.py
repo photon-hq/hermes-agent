@@ -29,7 +29,8 @@ from gateway.platforms._shared import send_error
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.platforms.helpers import MessageDeduplicator, bounded_put, cancel_task, compile_mention_patterns
-from gateway.platforms.helpers import strip_markdown
+from gateway.platforms.helpers import bypasses_chat_order, chat_ordered_work, spoken_mention_clips, strip_markdown
+from gateway.platforms.helpers import voice_mention_gate_enabled
 from gateway.platforms.send_targets import regex_stripped_parser
 from hermes_cli.fs_utils import rmtree_force
 from hermes_constants import get_hermes_home
@@ -368,6 +369,13 @@ def _content_text(content: dict[str, Any]) -> str:
     return ""
 
 
+def _carries_voice(content: dict[str, Any]) -> bool:
+    """A voice note, alone or in a ``group`` payload: only speech can hold a spoken wake word."""
+    if content.get("type") == "group":
+        return any(isinstance(p, dict) and p.get("type") == "voice" for p in content.get("parts") or [])
+    return content.get("type") == "voice"
+
+
 def _merge_parts(parts: list[_Normalized]) -> _Normalized:
     """One event for a group payload: texts joined, media in order, the first media part's type."""
     texts = [text for text, mtype, urls, _ in parts if mtype == MessageType.TEXT or not urls]
@@ -646,12 +654,26 @@ class PhotonAdapter(BasePlatformAdapter):
         handle = (message.get("sentBy") or {}).get("handle") or ""
         direct = (message.get("space") or {}).get("kind") == "direct"
         self._api.remember(route, handle if direct else None)  # a number names its DM, never a group
+        # A group voice note may wait on gate-time STT: run it off this worker, FIFO per chat, so it
+        # delays only its own chat, and a running-agent escape hatch (/stop) never waits behind it.
+        # Queued work's cursor is saved when it is queued: a gateway stopped before it runs drops it.
+        content = message.get("content") or {}
+        transcribes = (not direct and self.require_mention and _carries_voice(content)
+                       and voice_mention_gate_enabled(self.config.extra))
+        work = chat_ordered_work(self)
+        command = content.get("type") == "text" and bypasses_chat_order(content.get("text"))
+        if transcribes or (work.busy(route.space_id) and not command):
+            work.submit(route.space_id, lambda: self._handle_received(message, route, handle), transcribes=transcribes)
+            return
+        await self._handle_received(message, route, handle)
+
+    async def _handle_received(self, message: dict[str, Any], route: _Route, handle: str) -> None:
         await self._deliver_message(message, route, handle)
         if _env_flag("PHOTON_READ_RECEIPTS", "true"):
             try:
-                await self._api.mark_read(message_id)
+                await self._api.mark_read(message["id"])
             except PhotonError as e:
-                logger.debug("[photon] read receipt for %s failed: %s", message_id, e)
+                logger.debug("[photon] read receipt for %s failed: %s", message["id"], e)
 
     async def _deliver_message(self, message: dict[str, Any], route: _Route, handle: str) -> None:
         content = message.get("content") or {}
@@ -659,12 +681,28 @@ class PhotonAdapter(BasePlatformAdapter):
             logger.debug("[photon] ignoring %s content", content.get("type"))
             return
         chat_type = "dm" if (message.get("space") or {}).get("kind") == "direct" else "group"
-        # Mention gate BEFORE normalising: a dropped group message must not download attachments.
+        user_id = handle or (message.get("sentBy") or {}).get("id")
+        source = self.build_source(chat_id=route.space_id, chat_name=route.space_id, chat_type=chat_type,
+                                   user_id=user_id, user_name=user_id or None, message_id=message["id"])
+        # Mention gate BEFORE normalising: a dropped group message must not download attachments. A
+        # voice note can only say the wake word out loud, so the opt-in spoken gate listens to it.
         gated = chat_type == "group" and self.require_mention
-        if gated and not self._message_matches_mention_patterns(_content_text(content)):
+        typed = gated and self._message_matches_mention_patterns(_content_text(content))
+        spoken = gated and not typed and _carries_voice(content) and voice_mention_gate_enabled(self.config.extra)
+        if gated and not (typed or spoken):
             logger.debug("[photon] ignoring group message (require_mention=true, no mention pattern matched)")
             return
         text, mtype, media_urls, media_types = await self._normalize(content)
+        if spoken:
+            # Only the audio enters STT; a rejected payload's other downloads are deleted with it.
+            audio = [url for url, mime in zip(media_urls, media_types) if mime.lower().startswith("audio/")]
+            if not await spoken_mention_clips(audio, self._mention_patterns, adapter=self, source=source):
+                for path in set(media_urls) - set(audio):
+                    with contextlib.suppress(OSError):
+                        await asyncio.to_thread(Path(path).unlink)
+                logger.debug("[photon] ignoring group voice note (require_mention=true, no wake word spoken)")
+                return
+            mtype = MessageType.VOICE  # speech admitted it: a document-first payload must still reach STT
         if gated:
             text = self._clean_mention_text(text)
         reply: dict[str, Any] = {}
@@ -673,9 +711,6 @@ class PhotonAdapter(BasePlatformAdapter):
             stored = _lookup_sent_text(route.space_id, parent_id)
             reply = {"reply_to_message_id": parent_id, "reply_to_text": stored,
                      "reply_to_is_own_message": parent_id in self._sent_message_ids or stored is not None}
-        user_id = handle or (message.get("sentBy") or {}).get("id")
-        source = self.build_source(chat_id=route.space_id, chat_name=route.space_id, chat_type=chat_type,
-                                   user_id=user_id, user_name=user_id or None, message_id=message["id"])
         await self.handle_message(MessageEvent(
             text=text, message_type=mtype, source=source, message_id=message["id"], raw_message=message,
             timestamp=_parse_timestamp(message.get("createdAt")), media_urls=media_urls,
@@ -706,7 +741,9 @@ class PhotonAdapter(BasePlatformAdapter):
         label = "voice" if is_voice else "attachment"
         cached = await asyncio.to_thread(_cache_attachment, data, name, mime, is_voice=is_voice) if data else None
         if cached:
-            return f"({label})", mtype, [cached], [mime or ("audio/mp4" if is_voice else "application/octet-stream")]
+            if is_voice and not mime.lower().startswith("audio/"):  # cached as audio, so typed as audio for STT
+                mime = "audio/x-caf" if name.lower().endswith(".caf") else "audio/mp4"
+            return f"({label})", mtype, [cached], [mime or "application/octet-stream"]
         return f"[Photon {label} received: {name} ({mime or 'unknown MIME'})]", mtype, [], []
 
     # -- Outbound --------------------------------------------------------------------------------
