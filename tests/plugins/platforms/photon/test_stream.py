@@ -256,10 +256,11 @@ async def test_deliveries_are_handled_in_order_and_checkpointed(api, sockets, ad
     socket.deliver(_text(1), 1)
     socket.deliver(_text(2), 2)
     socket.deliver(_text(1), 1)  # at or before the cursor: already handled
-    await async_wait_until(lambda: a._cursor == 2, what="cursor 2")
+    # The cursor file is written off the loop after the in-memory cursor moves: wait for the file.
+    await async_wait_until(lambda: photon_adapter._load_cursor(FakePhotonApi.PROJECT_ID) == 2, what="cursor 2 saved")
 
     assert [e.text for e in captured] == ["m1", "m2"]
-    assert photon_adapter._load_cursor(FakePhotonApi.PROJECT_ID) == 2
+    assert a._cursor == 2
 
 
 @pytest.mark.asyncio
