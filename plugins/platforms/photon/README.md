@@ -173,5 +173,10 @@ gateway stops the adapter with a notice to create a Photon 2.0 account and run
 existing Photon sessions start fresh. Setup replaces a `PHOTON_HOME_CHANNEL` that still holds a
 GUID with your number; set it by hand to a phone number or a space id otherwise.
 
+The adapter's first connect after the upgrade deletes what the Spectrum sidecar left on disk: its
+npm packages beside the plugin, the copy a read-only install kept in `<hermes-home>/photon/sidecar`,
+and its runtime record `photon-sidecar.json` (port, local token, pid). The old Node process itself
+exits with the gateway that started it.
+
 [photon]: https://photon.codes/
 [beta]: https://app.beta.photon.codes/

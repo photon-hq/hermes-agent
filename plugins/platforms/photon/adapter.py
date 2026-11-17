@@ -31,6 +31,7 @@ from gateway.platforms.event import MessageEvent, MessageType
 from gateway.platforms.helpers import MessageDeduplicator, bounded_put, cancel_task, compile_mention_patterns
 from gateway.platforms.helpers import strip_markdown
 from gateway.platforms.send_targets import regex_stripped_parser
+from hermes_cli.fs_utils import rmtree_force
 from hermes_constants import get_hermes_home
 from utils import atomic_json_write
 
@@ -73,6 +74,8 @@ _SPACE_ID_RE = re.compile(r"^pho_spc_[0-7][0-9a-hjkmnp-tv-z]{25}$")
 # Content types that describe a conversation rather than say anything in it.
 _SIGNAL_CONTENT_TYPES = {"message.read", "space.typing.update", "space.background.update"}
 _CURSOR_FILE = "photon_events.json"
+# The Spectrum adapter's Node sidecar ran from here; an in-place upgrade keeps its untracked npm packages.
+_SIDECAR_SOURCE_DIR = Path(__file__).parent / "sidecar"
 
 
 # -- Dependencies (the `photon` extra) ----------------------------------------------------
@@ -159,6 +162,26 @@ def _load_cursor(project_id: str) -> int:
 
 def _save_cursor(project_id: str, seq: int) -> None:
     atomic_json_write(_cursor_path(), {"project_id": project_id, "seq": seq})
+
+
+# -- Spectrum sidecar leftovers --------------------------------------------------------------
+
+def _remove_sidecar_leftovers() -> None:
+    """Delete what the Spectrum sidecar left behind: its npm packages beside this module, the copy a
+    read-only install mirrored into the profile home, and its runtime record (port, local token, pid).
+    Nothing reads them any more. Best-effort and blocking."""
+    home = get_hermes_home()
+    for record in (home / "photon-sidecar.json", home / "runtime" / "photon-sidecar.json"):
+        with contextlib.suppress(OSError):
+            record.unlink(missing_ok=True)
+    for tree in (_SIDECAR_SOURCE_DIR, home / "photon" / "sidecar"):
+        if tree.is_dir() and not tree.is_symlink():
+            try:
+                rmtree_force(tree)
+            except OSError:
+                logger.debug("[photon] could not remove the old sidecar at %s", tree, exc_info=True)
+    with contextlib.suppress(OSError):
+        (home / "photon").rmdir()
 
 
 # -- Sent-text index (quoted context for threaded replies to our own messages) ---------------
@@ -450,6 +473,7 @@ class PhotonAdapter(BasePlatformAdapter):
     # -- Connection lifecycle -------------------------------------------------------------------
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
+        await asyncio.to_thread(_remove_sidecar_leftovers)
         if not ensure_photon_deps():
             self._set_fatal_error("MISSING_DEP", "Photon's Python client (the `photon` extra) is not installed",
                                   retryable=False)

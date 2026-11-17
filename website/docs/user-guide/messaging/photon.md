@@ -87,7 +87,8 @@ account at [app.beta.photon.codes][app] and run `hermes photon setup`. It keeps
 your Spectrum credentials in `auth.json` so your Spectrum projects can move over
 once Photon's migration tool ships. Conversations have new ids on Photon 2.0, so
 existing iMessage sessions start fresh, and setup points a `PHOTON_HOME_CHANNEL`
-that held a Spectrum chat id at your number.
+that held a Spectrum chat id at your number. The gateway deletes the old Node
+sidecar's files the first time it starts the Photon adapter.
 :::
 
 ## Authorizing users

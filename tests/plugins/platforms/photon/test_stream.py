@@ -192,6 +192,31 @@ async def test_spectrum_credentials_get_the_migration_notice(photon_home, socket
 
 
 @pytest.mark.asyncio
+async def test_connect_deletes_what_the_spectrum_sidecar_left(photon_home, sockets, adapter, monkeypatch, tmp_path):
+    from hermes_constants import get_hermes_home
+
+    home = get_hermes_home()
+    source = tmp_path / "plugin" / "sidecar"
+    mirror = home / "photon" / "sidecar"
+    records = (home / "photon-sidecar.json", home / "runtime" / "photon-sidecar.json")
+    for tree in (source, mirror):
+        (tree / "node_modules" / "spectrum-ts").mkdir(parents=True)
+        (tree / "node_modules" / "spectrum-ts" / "index.js").write_text("")
+        (tree / ".photon-npm-error.log").write_text("ENOSPC")
+    for record in records:
+        record.parent.mkdir(parents=True, exist_ok=True)
+        record.write_text('{"port": 8789, "token": "t", "pid": 1}')
+    (home / "runtime" / "keep.txt").write_text("")
+    monkeypatch.setattr(photon_adapter, "_SIDECAR_SOURCE_DIR", source)
+
+    assert await adapter().connect() is False  # no credentials: the cleanup runs first anyway
+
+    assert not source.exists() and not (home / "photon").exists()
+    assert not any(record.exists() for record in records)
+    assert (home / "runtime" / "keep.txt").exists()
+
+
+@pytest.mark.asyncio
 async def test_a_spectrum_install_reaches_the_notice_through_gateway_startup(photon_home, monkeypatch):
     from gateway.config import Platform, load_gateway_config
     from gateway.platform_registry import platform_registry
