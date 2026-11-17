@@ -42,14 +42,17 @@ def _dingtalk():
 
 
 def _photon():
-    from plugins.platforms.photon.adapter import PhotonAdapter
+    from plugins.platforms.photon.adapter import PhotonAdapter, _Route
     a = PhotonAdapter(PlatformConfig(enabled=True, extra={}))
     wire = []
 
-    async def post_send(path, body, **_k):
-        wire.append(body["text"])
-        return SimpleNamespace(success=True, message_id="m")
-    a._post_send = post_send
+    async def route(chat_id):
+        return _Route(chat_id, "agent")
+
+    async def send_text(_route, text):
+        wire.append(text)
+        return "m"
+    a._api = SimpleNamespace(route=route, send_text=send_text)
     return a, wire
 
 
