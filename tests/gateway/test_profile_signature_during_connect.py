@@ -41,7 +41,6 @@ async def test_config_saved_during_connect_is_rescanned(tmp_path, monkeypatch, s
     runner._sync_voice_mode_state_to_adapter = lambda *a: None
     runner._restore_secondary_completion_ledgers = lambda *a: None
     runner._adapter_credential_claim = lambda *a: None
-    runner._adapter_listener_claim = lambda *a: None
     runner._create_adapter = lambda platform, config: SimpleNamespace(platform=platform)
     runner._note_served_profiles([("default", home)])
     connected = []

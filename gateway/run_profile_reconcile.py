@@ -446,7 +446,7 @@ class GatewayProfileReconcileMixin:
 
     def _live_resource_claims(self, active: str) -> dict[tuple, str]:
         """Startup's ``claimed`` map rebuilt from what is live now: primary claims plus every connected
-        secondary's credential/listener, so a hot-added profile reusing a token is parked, never a
+        secondary's credential, so a hot-added profile reusing a token is parked, never a
         second poller."""
         claimed = self._primary_resource_claims(active)
         for profile_name, adapters in (getattr(self, "_profile_adapters", None) or {}).items():
