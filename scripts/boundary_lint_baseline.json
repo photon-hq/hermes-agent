@@ -475,6 +475,7 @@
     "plugins/platforms/photon/adapter.py gateway.status._pid_exists": 1,
     "plugins/platforms/photon/adapter.py hermes_cli._subprocess_compat.windows_hide_flags": 2,
     "plugins/platforms/photon/auth.py hermes_cli.auth._auth_store_lock": 1,
+    "plugins/platforms/photon/auth.py pm.extras.ensure_and_bind": 1,
     "plugins/platforms/photon/cli.py hermes_cli.colors.Colors": 1,
     "plugins/platforms/photon/cli.py hermes_cli.colors.color": 1,
     "plugins/platforms/qqbot/adapter.py gateway.platforms.media_cache.ext_for_mime": 1,
