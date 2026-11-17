@@ -62,8 +62,9 @@ Hermes runs on Photon 2.0 (`https://api.photon.codes/v1`). No account yet? Creat
 2. **Assign a shared iMessage line** to your phone number (idempotent; reuses an existing
    assignment) and print the number you text to reach your agent.
 3. **Wait for your first text.** A shared line can only reply to, or start a conversation
-   with, a number that has texted it. On a terminal, setup waits up to five minutes for that
-   message; otherwise `hermes photon status` shows when routing goes live.
+   with, a number that has texted it since the assignment was made. Photon reports that as the
+   assignment's opt-in (`optIn.state` turns `received`). On a terminal, setup waits up to five
+   minutes for it; otherwise `hermes photon status` shows when routing goes live.
 4. **Enable the platform** in `config.yaml` and allowlist your number.
 
 **No browser at all:** create a project API key in the dashboard and set the two variables in
@@ -109,7 +110,7 @@ stored there:
       { "project_id": "pho_prj_...", "organization_id": "pho_org_...", "api_key_id": "...", "name": "Hermes Agent" }
     ],
     "photon_user": [
-      { "phone_number": "+15551234567", "assigned_phone_number": "+1628...", "assigned_at": "..." }
+      { "phone_number": "+15551234567", "assigned_phone_number": "+1628..." }
     ],
     "photon_legacy": [   // only after moving off Photon Spectrum
       { "spectrum_project_id": "...", "project_secret": "..." }

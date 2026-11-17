@@ -86,25 +86,16 @@ class FakePhotonApi:
                 "permissionsUpdatedAt": None, "projectId": cls.PROJECT_ID, "revokedAt": None}
 
     @classmethod
-    def assignment(cls, handle: str, number: str = "+16282679185") -> dict:
+    def assignment(cls, handle: str, number: str = "+16282679185", *, opted_in: bool = False) -> dict:
+        """A shared-line assignment; ``opted_in`` once ``handle`` has texted the line since it was created."""
+        opt_in = {"state": "received", "receivedAt": cls.NOW} if opted_in else {"state": "pending"}
         return {"assignedPhoneNumber": number, "assignmentId": "pho_asg_1", "createdAt": cls.NOW,
-                "handle": handle, "platform": "imessage", "projectId": cls.PROJECT_ID, "updatedAt": cls.NOW}
+                "handle": handle, "optIn": opt_in, "platform": "imessage", "projectId": cls.PROJECT_ID,
+                "updatedAt": cls.NOW}
 
     @classmethod
     def shared_mode(cls) -> dict:
         return {"dedicatedLineAvailableNow": False, "maxUserAssignments": 5, "mode": "shared"}
-
-    @classmethod
-    def received_text(cls, handle: str) -> dict:
-        project_id = cls.PROJECT_ID
-        return {"content": {"format": "plain", "text": "hi", "type": "text"}, "createdAt": cls.NOW,
-                "id": "pho_msg_1", "metadata": {}, "platform": "imessage", "projectId": project_id,
-                "sentBy": {"details": {"type": "shared"}, "handle": handle, "id": "pho_usr_1", "kind": "person",
-                           "metadata": {}, "platform": "imessage", "projectId": project_id},
-                "space": {"details": {}, "id": "pho_spc_1", "kind": "direct", "metadata": {},
-                          "participantIds": ["pho_usr_1", "pho_usr_2"], "platform": "imessage",
-                          "projectId": project_id},
-                "status": "received", "timestamps": {"receivedAt": cls.NOW}, "updatedAt": cls.NOW}
 
 
 @pytest.fixture

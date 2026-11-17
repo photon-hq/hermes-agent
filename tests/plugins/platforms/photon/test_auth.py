@@ -202,17 +202,30 @@ def test_assignment_needs_an_e164_number(photon_api) -> None:
     assert photon_api.requests == []
 
 
-def test_first_text_is_detected_from_received_messages(photon_api) -> None:
-    path = f"/v1/projects/{PROJECT_ID}/messages"
-    photon_api.on("GET", path, {"items": [photon_api.received_text("+15550000000")], "nextPageToken": "p2"},
-                  {"items": [photon_api.received_text(PHONE)]})
+@pytest.mark.parametrize("state, texted", [("received", True), ("pending", False), ("paused", False)])
+def test_first_text_is_the_assignments_opt_in(photon_api, state, texted) -> None:
+    """Photon's ``optIn`` on the operator's own assignment decides; a state it adds later is not opted in."""
+    mine = photon_api.assignment(PHONE)
+    mine["optIn"] = {"state": state, "receivedAt": photon_api.NOW} if state == "received" else {"state": state}
+    photon_api.on("GET", _ASSIGNMENTS, {"assignments": [photon_api.assignment("+15550000000", opted_in=True)],
+                                        "nextPageToken": "p2"}, {"assignments": [mine]})
 
-    assert photon_auth.has_texted_line("pho_sk", PROJECT_ID, PHONE, photon_api.NOW) is True
-    first = photon_api.calls("GET", path)[0].url.params
-    assert (first["createdSince"], first["direction"]) == (photon_api.NOW, "received")
+    assert photon_auth.has_texted_line("pho_sk", PROJECT_ID, PHONE) is texted
+    assert photon_api.calls("GET", f"/v1/projects/{PROJECT_ID}/messages") == []
 
 
-def test_no_first_text_yet(photon_api) -> None:
-    photon_api.on("GET", f"/v1/projects/{PROJECT_ID}/messages", {"items": [photon_api.received_text("+15550000000")]})
+def test_no_assignment_means_no_first_text(photon_api) -> None:
+    photon_api.on("GET", _ASSIGNMENTS, {"assignments": []})
 
-    assert photon_auth.has_texted_line("pho_sk", PROJECT_ID, PHONE, photon_api.NOW) is False
+    assert photon_auth.has_texted_line("pho_sk", PROJECT_ID, PHONE) is False
+
+
+def test_waiting_for_the_first_text_polls_until_the_opt_in_lands(photon_api) -> None:
+    photon_api.on("GET", _ASSIGNMENTS, {"assignments": [photon_api.assignment(PHONE)]},
+                  {"assignments": [photon_api.assignment(PHONE, opted_in=True)]})
+    sleeps: list[float] = []
+
+    assert photon_auth.wait_for_first_text("pho_sk", PROJECT_ID, PHONE, sleep_fn=sleeps.append,
+                                           clock=lambda: 0.0) is True
+    assert sleeps == [5.0]
+    assert len(photon_api.calls("GET", _ASSIGNMENTS)) == 2

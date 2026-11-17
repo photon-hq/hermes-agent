@@ -475,15 +475,19 @@ def get_imessage_mode(token: str, project_id: str) -> str:
 
 
 def _assignment(record: dict[str, Any]) -> dict[str, Any]:
+    # optIn turns "received" once the handle has texted the line since this assignment was
+    # created; until then Photon refuses sends to it. Any other state counts as not opted in.
+    opted_in = (record.get("optIn") or {}).get("state") == "received"
     return {"assignment_id": record["assignmentId"], "handle": record["handle"],
-            "assigned_phone_number": record["assignedPhoneNumber"], "created_at": record["createdAt"]}
+            "assigned_phone_number": record["assignedPhoneNumber"], "opted_in": opted_in}
 
 
-def find_line_assignment(token: str, project_id: str, phone: str) -> Optional[dict[str, Any]]:
+def find_line_assignment(token: str, project_id: str, phone: str, *,
+                         timeout: float = 30.0) -> Optional[dict[str, Any]]:
     """The active shared-line assignment for ``phone``, or None."""
     target = _normalize_phone(phone)
     query: dict[str, Any] = {"pageSize": 100}
-    with _photon(token) as photon:
+    with _photon(token, timeout=timeout) as photon:
         while True:
             page = _data(photon.projects.platforms.imessage.assignments.list(_rpc(
                 "ListSharedLineAssignmentsInput", {"path": {"id": project_id}, "query": query})))
@@ -519,26 +523,15 @@ def ensure_line_assignment(
     return _assignment(created), True
 
 
-def has_texted_line(api_key: str, project_id: str, phone: str, since: str, *, timeout: float = 30.0) -> bool:
-    """True once ``phone`` has messaged the project since ``since`` (its assignment's creation).
-    A shared line can only message people who have texted it, so this is when routing goes live."""
-    target = _normalize_phone(phone)
-    query: dict[str, Any] = {"createdSince": since, "direction": "received", "platform": "imessage",
-                             "order": "asc", "pageSize": 100}
-    with _photon(api_key, timeout=timeout) as photon:
-        while True:
-            page = _data(photon.projects.list_messages(
-                _rpc("ListMessagesInput", {"path": {"id": project_id}, "query": query})))
-            if any(_normalize_phone((m.get("sentBy") or {}).get("handle") or "") == target
-                   for m in page.get("items") or []):
-                return True
-            if not page.get("nextPageToken"):
-                return False
-            query["pageToken"] = page["nextPageToken"]
+def has_texted_line(api_key: str, project_id: str, phone: str, *, timeout: float = 30.0) -> bool:
+    """True once ``phone``'s shared-line assignment has opted in: a shared line can only message
+    people who have texted it since their assignment, so this is when routing goes live."""
+    found = find_line_assignment(api_key, project_id, phone, timeout=timeout)
+    return bool(found and found["opted_in"])
 
 
 def wait_for_first_text(
-    api_key: str, project_id: str, phone: str, since: str, *, timeout_s: float = 300.0,
+    api_key: str, project_id: str, phone: str, *, timeout_s: float = 300.0,
     interval_s: float = 5.0, on_waiting: Optional[Callable[[int], None]] = None,
     sleep_fn: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic) -> bool:
     """Poll until ``phone`` texts the line, bounded by both an attempt cap and a wall-clock
@@ -547,7 +540,7 @@ def wait_for_first_text(
     max_attempts = max(1, int(timeout_s / interval_s))
     for attempt in range(1, max_attempts + 1):
         try:
-            if has_texted_line(api_key, project_id, phone, since):
+            if has_texted_line(api_key, project_id, phone):
                 return True
         except PhotonError as exc:
             logger.debug("photon: first-text poll failed (attempt %d): %s", attempt, exc)
@@ -563,14 +556,14 @@ def wait_for_first_text(
 
 def store_user_numbers(
     *, phone_number: Optional[str] = None, assigned_phone_number: Optional[str] = None,
-    assigned_at: Optional[str] = None, project_id: Optional[str] = None) -> None:
+    project_id: Optional[str] = None) -> None:
     """Persist non-secret operator numbers for offline ``status`` output."""
     if not phone_number and not assigned_phone_number:
         return
     record: dict[str, Any] = {"issued_at": _now()}
     record.update({k: v for k, v in (
         ("phone_number", phone_number), ("assigned_phone_number", assigned_phone_number),
-        ("assigned_at", assigned_at), ("project_id", project_id)) if v})
+        ("project_id", project_id)) if v})
     _store_pool_record("photon_user", record)
 
 
@@ -596,8 +589,7 @@ def refresh_user_numbers() -> tuple[Optional[str], Optional[str]]:
     found = find_line_assignment(api_key, project_id, phone)
     if found:
         assigned = found["assigned_phone_number"]
-        store_user_numbers(phone_number=phone, assigned_phone_number=assigned,
-                           assigned_at=found["created_at"], project_id=project_id)
+        store_user_numbers(phone_number=phone, assigned_phone_number=assigned, project_id=project_id)
     return phone, assigned
 
 
@@ -649,11 +641,10 @@ def print_routing_status(emit: Any = print) -> None:
     it since its assignment. Verified against the API, not local markers."""
     phone, assigned = load_user_numbers()
     project_id, api_key = load_runtime_credentials()
-    since = _user_record().get("assigned_at")
-    if not (phone and project_id and api_key and since):
+    if not (phone and assigned and project_id and api_key):
         return
     try:
-        texted = has_texted_line(api_key, project_id, phone, since, timeout=_STATUS_TIMEOUT_S)
+        texted = has_texted_line(api_key, project_id, phone, timeout=_STATUS_TIMEOUT_S)
     except (PhotonError, RuntimeError) as e:
         emit(f"  routing             : ? could not verify ({str(e) or type(e).__name__})")
         return

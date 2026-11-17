@@ -46,8 +46,7 @@ def _signed_in() -> None:
 
 def _line_routes(photon_api, *, texted: bool) -> None:
     photon_api.on("GET", f"{_PROJECT}/platforms/imessage", photon_api.shared_mode())
-    photon_api.on("GET", _ASSIGNMENTS, {"assignments": [photon_api.assignment(PHONE, LINE)]})
-    photon_api.on("GET", f"{_PROJECT}/messages", {"items": [photon_api.received_text(PHONE)] if texted else []})
+    photon_api.on("GET", _ASSIGNMENTS, {"assignments": [photon_api.assignment(PHONE, LINE, opted_in=texted)]})
 
 
 def test_autoconfigure_access_fills_unset(photon_home) -> None:
@@ -150,3 +149,18 @@ def test_setup_without_phone_does_not_report_complete(photon_api, non_interactiv
     assert "setup complete" not in out
     assert "routing is NOT live" in out and "--phone" in out
     assert photon_api.calls("GET", _ASSIGNMENTS) == []
+
+
+@pytest.mark.parametrize("texted, row", [(True, "✓ live"), (False, "✗ not live")])
+def test_status_reads_routing_from_the_opt_in(photon_api, monkeypatch, texted, row) -> None:
+    monkeypatch.setenv("PHOTON_PROJECT_ID", PROJECT_ID)
+    monkeypatch.setenv("PHOTON_API_KEY", "pho_sk_env")
+    photon_auth.store_user_numbers(phone_number=PHONE, assigned_phone_number=LINE, project_id=PROJECT_ID)
+    photon_api.on("GET", _ASSIGNMENTS, {"assignments": [photon_api.assignment(PHONE, LINE, opted_in=texted)]})
+    rows: list[str] = []
+
+    photon_auth.print_routing_status(rows.append)
+
+    [routing] = rows
+    assert routing.startswith("  routing") and row in routing
+    assert photon_api.calls("GET", f"{_PROJECT}/messages") == []

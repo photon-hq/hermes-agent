@@ -173,11 +173,10 @@ _FIRST_TEXT_WAIT_S = 300
 def _wait_for_first_text(project_id: str, api_key: str, phone: str, assignment: dict) -> bool:
     """A shared line can only reply to and start conversations with a number that has texted
     it. Name that one manual step and, on a TTY, wait (bounded) for it. True once it landed."""
-    line, since = assignment["assigned_phone_number"], assignment["created_at"]
-    with contextlib.suppress(photon_auth.PhotonError):  # a failed check just means we ask and wait
-        if photon_auth.has_texted_line(api_key, project_id, phone, since):
-            print("  ✓ you've texted your line — routing is live")
-            return True
+    line = assignment["assigned_phone_number"]
+    if assignment["opted_in"]:
+        print("  ✓ you've texted your line — routing is live")
+        return True
     print("\n" + color("      One manual step: text your agent", Colors.CYAN, Colors.BOLD))
     print("      Photon's shared line can only message you after you've messaged it:\n"
           f"        1. Open Messages on {phone}.\n"
@@ -193,7 +192,7 @@ def _wait_for_first_text(project_id: str, api_key: str, phone: str, assignment: 
             print("      ... still waiting for your message to land")
     try:
         texted = photon_auth.wait_for_first_text(
-            api_key, project_id, phone, since, timeout_s=_FIRST_TEXT_WAIT_S, on_waiting=_on_waiting)
+            api_key, project_id, phone, timeout_s=_FIRST_TEXT_WAIT_S, on_waiting=_on_waiting)
         why = f"No message seen within {_FIRST_TEXT_WAIT_S // 60} minutes."
     except KeyboardInterrupt:
         texted, why = False, "Wait skipped (Ctrl-C)."
@@ -251,9 +250,7 @@ def _cmd_setup(args: argparse.Namespace) -> int:
             line = assignment["assigned_phone_number"]
             _show_agent_number(line)
             try:
-                photon_auth.store_user_numbers(
-                    phone_number=phone, assigned_phone_number=line,
-                    assigned_at=assignment["created_at"], project_id=project_id)
+                photon_auth.store_user_numbers(phone_number=phone, assigned_phone_number=line, project_id=project_id)
             except OSError as e:
                 print(f"      (could not save Photon status metadata: {e})", file=sys.stderr)
             routing_live = _wait_for_first_text(project_id, api_key, phone, assignment)

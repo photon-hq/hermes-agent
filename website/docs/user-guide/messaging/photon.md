@@ -71,7 +71,8 @@ The setup, in order:
 2. **Assigns a shared iMessage line** to your phone number (re-running reuses it) and prints
    the number you text to reach your agent.
 3. **Waits for your first text**: a shared line can only message you after you have messaged
-   it once. `hermes photon status` shows when routing is live.
+   it once. Photon tells Hermes when that text has arrived, and `hermes photon status` shows
+   when routing is live.
 4. **Enables the platform** and allowlists your number.
 
 Runtime credentials are written to `~/.hermes/.env` (`PHOTON_PROJECT_ID`,
