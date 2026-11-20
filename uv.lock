@@ -2728,7 +2728,7 @@ requires-dist = [
     { name = "parallel-web", marker = "extra == 'parallel-web'", specifier = "==0.6.0" },
     { name = "pathspec", marker = "python_full_version >= '3.14'", specifier = "==1.1.1" },
     { name = "pdfplumber", marker = "extra == 'documents-pdf'", specifier = "==0.11.10" },
-    { name = "photonhq-api", marker = "extra == 'photon'", specifier = "==0.6.0" },
+    { name = "photonhq-api", marker = "extra == 'photon'", specifier = "==0.7.0" },
     { name = "pilk", marker = "extra == 'silk'", specifier = "==0.2.4" },
     { name = "pillow", marker = "python_full_version >= '3.14'", specifier = "==13.0.0" },
     { name = "pillow-heif", marker = "python_full_version >= '3.14'", specifier = ">=1.4.0,<2" },
@@ -4638,16 +4638,17 @@ wheels = [
 
 [[package]]
 name = "photonhq-api"
-version = "0.6.0"
+version = "0.7.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "email-validator" },
     { name = "httpx" },
     { name = "pydantic" },
+    { name = "standardwebhooks" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/70/63/46e5b5018b0f5370225555956f8ec6266a5d959d822d7b971bd90e8a21c9/photonhq_api-0.6.0.tar.gz", hash = "sha256:a19e01e9edf688c847edd243f5e9e8a75b6530bb18264da9f71c300062142c9c", size = 165391, upload-time = "2026-10-23T06:48:17.812Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/bd/23/54f91cfe3c3f60fad76cb697ff91398959d491607d5c45f00aa2d40fa233/photonhq_api-0.7.0.tar.gz", hash = "sha256:44087c6d2c242092c5984a14a788988aa91cc7ebd852f8203612b227ee478ac6", size = 199611, upload-time = "2026-11-17T00:02:36.769Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/51/a2/51985e93ccbc7a6c2f4ff3b54c03dfa411b993ed2652e9287c1af8f519b8/photonhq_api-0.6.0-py3-none-any.whl", hash = "sha256:814eada5eb3176788ce35c4f73be941fd0405b040799769e1466fdb595774576", size = 166769, upload-time = "2026-10-23T06:48:16.273Z" },
+    { url = "https://files.pythonhosted.org/packages/a7/c7/38bb4f460f8b97fa621fb0a3e3aeb9f5b9df2b94646dfb293de9358b2b69/photonhq_api-0.7.0-py3-none-any.whl", hash = "sha256:f0b544e6ffa398125b869914e43397f6b6cf6936310a362dbd25ae95dd3fcc09", size = 199696, upload-time = "2026-11-17T00:02:35.261Z" },
 ]
 
 [[package]]
@@ -6690,6 +6691,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/e4/be/0123026f719d1a7936f214a88b553bb5701e04ff2511147c1dab0c5035eb/sse_starlette-3.5.0.tar.gz", hash = "sha256:75de713aa8a9441513cc283220826da079d982770965b951e9437720e8bafdb2", size = 36794, upload-time = "2026-09-28T17:48:14.7Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/be/e4/cdda14023c316d71493bc54fdffc3dd006631b88866145c9d3cc33e0f1df/sse_starlette-3.5.0-py3-none-any.whl", hash = "sha256:3e6e1070df3f0f5d9cea81496de92dbb72f6721871d99748ece67441dd8b7997", size = 17407, upload-time = "2026-09-28T17:48:13.228Z" },
+]
+
+[[package]]
+name = "standardwebhooks"
+version = "1.1.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/50/81/a26b812525dd9ad6cc0f6ba2f8eafd5bf595542e319d95123aa92b51bf22/standardwebhooks-1.1.0.tar.gz", hash = "sha256:e5cb66e21a6356ebb9375aeb57f1348583323015808d475a7c1baaa4b718068a", size = 3232, upload-time = "2026-07-21T15:49:51.45Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/21/dc/0cd2bd9a536e61ad0ee9de3b724492a38faa88ce1828fbc15940824664c3/standardwebhooks-1.1.0-py3-none-any.whl", hash = "sha256:9a88d48a1f198be61517fc7ad328cf58ba02b73f0fbd8941d4213e9c0b6c2a61", size = 3538, upload-time = "2026-07-21T15:49:50.519Z" },
 ]
 
 [[package]]
