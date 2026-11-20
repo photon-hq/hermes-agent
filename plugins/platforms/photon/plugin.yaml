@@ -11,25 +11,30 @@ description: >
   no public URL, no signing secret), and outbound messages are sent over
   the same sidecar.
 
-  The plugin ships with a `hermes photon` CLI for the one-time device
-  login + project + user setup. Runtime credentials are written to
-  ``~/.hermes/.env`` (``PHOTON_PROJECT_ID`` = the Spectrum project id,
-  ``PHOTON_PROJECT_SECRET``) like every other channel, with management
-  metadata (device token, dashboard project id) in ``~/.hermes/auth.json``.
+  The plugin ships with a `hermes photon setup` CLI that connects a Photon 2.0
+  project: device login, project, project API key and a shared iMessage line.
+  Runtime credentials are written to ``~/.hermes/.env`` (``PHOTON_PROJECT_ID``,
+  ``PHOTON_API_KEY``) like every other channel, with management metadata
+  (device-login session, project and key ids) in ``~/.hermes/auth.json``.
+  Setting both variables by hand skips the browser sign-in entirely.
   Photon's free shared-line model lets users get started without a paid plan.
 author: NousResearch
 requires_env:
   - name: PHOTON_PROJECT_ID
-    description: "Spectrum project id (the project's spectrumProjectId; set by `hermes photon setup`)"
-    prompt: "Photon Spectrum project id"
-    url: "https://app.photon.codes/"
+    description: "Photon 2.0 project id (pho_prj_...; set by `hermes photon setup`)"
+    prompt: "Photon project id"
+    url: "https://app.beta.photon.codes/"
     password: false
-  - name: PHOTON_PROJECT_SECRET
-    description: "Project secret paired with the Spectrum project id (set by `hermes photon setup`)"
-    prompt: "Photon project secret"
-    url: "https://app.photon.codes/"
+  - name: PHOTON_API_KEY
+    description: "Photon 2.0 project API key (pho_sk_...; set by `hermes photon setup`)"
+    prompt: "Photon project API key"
+    url: "https://app.beta.photon.codes/"
     password: true
 optional_env:
+  - name: PHOTON_PROJECT_SECRET
+    description: "Photon Spectrum project secret (before Photon 2.0); `hermes photon setup` moves it into auth.json"
+    prompt: "Photon Spectrum project secret"
+    password: true
   - name: PHOTON_SIDECAR_PORT
     description: "Loopback port for the Node sidecar control + inbound channel (default 8789)"
     prompt: "Sidecar control port"
@@ -46,13 +51,9 @@ optional_env:
     description: "Path to the node binary (default: PM's pinned node, then PATH)"
     prompt: "Node executable path"
     password: false
-  - name: PHOTON_DASHBOARD_HOST
-    description: "Photon Dashboard API host (default https://app.photon.codes)"
-    prompt: "Dashboard host"
-    password: false
-  - name: PHOTON_SPECTRUM_HOST
-    description: "Photon Spectrum API host (default https://spectrum.photon.codes)"
-    prompt: "Spectrum API host"
+  - name: PHOTON_API_HOST
+    description: "Photon API host (default https://api.photon.codes)"
+    prompt: "Photon API host"
     password: false
   - name: PHOTON_ALLOWED_USERS
     description: "Comma-separated E.164 phone numbers allowed to talk to the bot"
