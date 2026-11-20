@@ -141,10 +141,11 @@ class GatewaySecondaryReconnectMixin:
         self, profile_name: str, profile_home, platform: Platform, adapter: BasePlatformAdapter,
         claimed: dict[tuple, str],
     ) -> Optional[tuple]:
-        """Refuse a secondary adapter whose credential/listener another profile owns (a second poller on
-        one bot, a second bind on one port); otherwise record the profile as the bot's owner and return
-        its ``(credential_claim, listener_claim)``. None = refused (parked fatal)."""
-        credential_claim, listener_claim = self._adapter_claims(platform, adapter)
+        """Refuse a secondary adapter whose credential another profile owns (a second poller on one bot);
+        otherwise record the profile as the bot's owner and return its claims (``_adapter_claims``).
+        None = refused (parked fatal)."""
+        claims = self._adapter_claims(platform, adapter)
+        (credential_claim,) = claims
         owner_name = claimed.get(credential_claim) if credential_claim is not None else None
         owner_origin, incoming_origin = (None, None)
         if owner_name:
@@ -152,9 +153,9 @@ class GatewaySecondaryReconnectMixin:
                 owner_name, profile_name, profile_home, platform, adapter,
             )
         if self._refuse_duplicate_claim(
-            credential_claim, claimed, profile_name, platform, "credential",
+            credential_claim, claimed, profile_name, platform,
             owner_origin=owner_origin, incoming_origin=incoming_origin,
-        ) or self._refuse_duplicate_claim(listener_claim, claimed, profile_name, platform, "listener"):
+        ):
             return None
         # The profile owns this bot from here on, connected or not: cron and the delivery drain read
         # ownership here from another thread, never from the live map a fatal error rewrites.
@@ -162,20 +163,20 @@ class GatewaySecondaryReconnectMixin:
         if bot_platforms is None:
             bot_platforms = self._profile_bot_platforms = {}
         bot_platforms.setdefault(profile_name, set()).add(platform)
-        return credential_claim, listener_claim
+        return claims
 
     def _disown_secondary_platform(self, profile_name: str, platform: Platform) -> None:
         """Undo ``_claim_secondary_platform``'s ownership record for a never-built platform that gave up for good:
         cron and the delivery drain read it to decide that the profile owns the bot."""
         (getattr(self, "_profile_bot_platforms", None) or {}).get(profile_name, set()).discard(platform)
 
-    def _adapter_claims(self, platform: Platform, adapter: BasePlatformAdapter) -> tuple[Optional[tuple], Optional[tuple]]:
-        """``(credential_claim, listener_claim)`` of one adapter; either may be None. Never raises: unserve and a
-        fatal teardown compute it after the adapter left the map."""
-        return self._adapter_credential_claim(platform, adapter), self._adapter_listener_claim(platform, adapter)
+    def _adapter_claims(self, platform: Platform, adapter: BasePlatformAdapter) -> tuple[Optional[tuple]]:
+        """``(credential_claim,)`` of one adapter; the claim may be None. Never raises: unserve and a fatal
+        teardown compute it after the adapter left the map."""
+        return (self._adapter_credential_claim(platform, adapter),)
 
     def _hold_secondary_claims(self, profile_name: str, platform: Platform, owner, claims: tuple) -> None:
-        """Hold a secondary platform's credential/listener claims while it is not in ``_profile_adapters``
+        """Hold a secondary platform's credential claim while it is not in ``_profile_adapters``
         (initial connect, failed boot connect awaiting the handoff, fatal teardown, unserve teardown, queued
         to reconnect, or mid-heal), so no other profile takes the same bot meanwhile. A task owner's hold is
         released when that task finishes, however it finishes (cancelled before it ever ran included); an
@@ -206,7 +207,7 @@ class GatewaySecondaryReconnectMixin:
         }
 
     def _current_claim_owners(self, exclude: Optional[tuple] = None) -> dict[tuple, str]:
-        """Who owns each bot/listener right now: held claims (but ``exclude``'s) plus everything live. Read at
+        """Who owns each bot right now: held claims (but ``exclude``'s) plus everything live. Read at
         the moment of a claim check, never from a snapshot taken before an await (an owner may connect or let
         go meanwhile)."""
         active = getattr(self, "_primary_profile_name", None) or "default"

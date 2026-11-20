@@ -937,7 +937,6 @@ class TestRequeueHealsDeadReconnectWatcher:
             "next_retry": time.monotonic() + 300,
             "queued_at": time.monotonic() - 3600,
             "credential_claim": None,
-            "listener_claim": None,
         }
 
     @staticmethod
@@ -1099,7 +1098,6 @@ class TestSupervisionExhaustionHasAnOwner:
             "next_retry": time.monotonic() + 300,
             "queued_at": time.monotonic() - 7200,
             "credential_claim": None,
-            "listener_claim": None,
         }
 
     @staticmethod

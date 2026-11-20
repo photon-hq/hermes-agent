@@ -43,7 +43,7 @@ ANCHORS: dict[str, str | tuple[str, ...]] = {
     "telegram": "telegram",
     "discord": "discord",
     "slack": "slack_bolt",
-    "photon": "photon_api",
+    "photon": ("photon_api", "socketio", "aiohttp"),
     "matrix": ("mautrix", "asyncpg", "aiosqlite", "markdown", "aiohttp_socks"),
     "dingtalk": "dingtalk_stream",
     "feishu": "lark_oapi",

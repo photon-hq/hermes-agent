@@ -451,7 +451,7 @@ class TestSecondaryAdapterUnavailableRecovery:
         queued must not keep the old token reserved."""
         runner, create = _shared_token_runner(monkeypatch)
         _record_connects(monkeypatch, runner, result=False)
-        runner._hold_secondary_claims("a", Platform("irc"), None, (("credential", "irc", "old-token"), None))
+        runner._hold_secondary_claims("a", Platform("irc"), None, (("credential", "irc", "old-token"),))
         rebuilt = create(Platform("irc"), None)
         monkeypatch.setattr(runner, "_create_adapter", lambda platform, config: rebuilt)
 

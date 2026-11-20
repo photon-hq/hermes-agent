@@ -131,69 +131,47 @@ class TestDiscordConnectClassification:
         assert retryable is True
 
 
-# ── Photon: typed sidecar startup errors ───────────────────────────────
+# ── Photon: a rejected project key is final ────────────────────────────
 
 
-class TestPhotonSidecarStartupClassification:
-    def _make_adapter(self, monkeypatch):
-        monkeypatch.setenv("PHOTON_PROJECT_ID", "pid")
-        monkeypatch.setenv("PHOTON_PROJECT_SECRET", "psecret")
+class TestPhotonConnectClassification:
+    def _make_adapter(self, monkeypatch, failure):
+        monkeypatch.setenv("PHOTON_PROJECT_ID", "pho_prj_00000000000000000000000001")
+        monkeypatch.setenv("PHOTON_API_KEY", "pho_sk_test")
         from plugins.platforms.photon import adapter as photon_adapter
-        from plugins.platforms.photon.adapter import PhotonAdapter
 
-        # Stand-in for PM's node; the user's PATH node is never picked up.
-        monkeypatch.setattr(photon_adapter, "find_node_executable", lambda _name: "/pm/node")
+        async def _check_access(_api):
+            raise failure
 
-        return PhotonAdapter(PlatformConfig(enabled=True, token="", extra={}))
+        monkeypatch.setattr(photon_adapter._PhotonApi, "check_access", _check_access)
+        return photon_adapter.PhotonAdapter(PlatformConfig(enabled=True, token="", extra={}))
 
     @pytest.mark.asyncio
-    async def test_typed_startup_error_sets_nonretryable_fatal(self, monkeypatch):
+    @pytest.mark.parametrize("status", [401, 403, 404])
+    async def test_rejected_key_sets_nonretryable_fatal(self, monkeypatch, status):
         from plugins.platforms.photon import adapter as photon_adapter
 
-        adapter = self._make_adapter(monkeypatch)
+        rejected = photon_adapter.ApiError(
+            "unauthorized", status=status, headers={}, body=None, raw_body="",
+            operation_id="getProject", request_id=None,
+        )
+        adapter = self._make_adapter(monkeypatch, rejected)
 
-        async def _boom():
-            raise photon_adapter.PhotonSidecarStartupError(
-                "deps could not be installed",
-                code="SIDECAR_DEPS_MISSING",
-                retryable=False,
-            )
-
-        monkeypatch.setattr(adapter, "_start_sidecar", _boom)
-        ok = await adapter.connect()
-
-        assert ok is False
-        assert adapter.fatal_error_code == "SIDECAR_DEPS_MISSING"
+        assert await adapter.connect() is False
+        assert adapter.fatal_error_code == "AUTH_REJECTED"
         assert adapter.fatal_error_retryable is False
 
     @pytest.mark.asyncio
-    async def test_untyped_startup_error_stays_retryable(self, monkeypatch):
-        # Ambiguous failures (crash before ready, health timeout) must keep
-        # retrying; the gateway's needs_attention escalation is the backstop.
-        adapter = self._make_adapter(monkeypatch)
-
-        async def _boom():
-            raise RuntimeError("sidecar exited with code 1 before becoming ready")
-
-        monkeypatch.setattr(adapter, "_start_sidecar", _boom)
-        ok = await adapter.connect()
-
-        assert ok is False
-        assert adapter.fatal_error_code == "SIDECAR_FAILED"
-        assert adapter.fatal_error_retryable is True
-
-    def test_deps_install_failure_raises_typed_nonretryable(self, monkeypatch):
+    async def test_unreachable_api_stays_retryable(self, monkeypatch):
+        # A network failure says nothing about the key: keep retrying; the gateway's
+        # needs_attention escalation is the backstop.
         from plugins.platforms.photon import adapter as photon_adapter
 
-        adapter = self._make_adapter(monkeypatch)
-        monkeypatch.setattr(photon_adapter, "sidecar_deps_installed", lambda: False)
-        monkeypatch.setattr(photon_adapter, "_reinstall_sidecar_deps", lambda: None)
+        adapter = self._make_adapter(monkeypatch, photon_adapter.TransportError("connection refused"))
 
-        with pytest.raises(photon_adapter.PhotonSidecarStartupError) as exc_info:
-            asyncio.get_event_loop().run_until_complete(adapter._start_sidecar())
-
-        assert exc_info.value.code == "SIDECAR_DEPS_MISSING"
-        assert exc_info.value.retryable is False
+        assert await adapter.connect() is False
+        assert adapter.fatal_error_code == "CONNECT_FAILED"
+        assert adapter.fatal_error_retryable is True
 
 
 # ── Email: explicit fatal codes on IMAP/SMTP failure ───────────────────

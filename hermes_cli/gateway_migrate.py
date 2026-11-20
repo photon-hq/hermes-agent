@@ -466,7 +466,7 @@ def _credential_probe(platform_config) -> SimpleNamespace:
     return SimpleNamespace(
         token=getattr(platform_config, "token", None) or getattr(platform_config, "api_key", None),
         _app_id=extra.get("app_id"), _client_id=extra.get("client_id"), _bot_id=extra.get("bot_id"),
-        _project_secret=extra.get("project_secret"), config=platform_config,
+        _project_api_key=extra.get("project_api_key"), config=platform_config,
     )
 
 

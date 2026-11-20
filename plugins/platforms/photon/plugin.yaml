@@ -1,15 +1,13 @@
 name: photon-platform
 label: iMessage via Photon
 kind: platform
-version: 0.3.0
+version: 0.4.0
 description: >
-  Photon Spectrum gateway adapter for Hermes Agent.
-  Connects to iMessage (and other Spectrum interfaces) through Photon's
-  managed Spectrum platform. Both directions run over the `spectrum-ts`
-  SDK's long-lived gRPC stream via a small supervised Node sidecar —
-  inbound messages arrive on the SDK's `app.messages` stream (no webhook,
-  no public URL, no signing secret), and outbound messages are sent over
-  the same sidecar.
+  Photon 2.0 gateway adapter for Hermes Agent: iMessage through a Photon
+  shared line. Inbound messages arrive on the project's Socket.IO event
+  stream (no webhook, no public URL), resumed from the last handled event
+  after a restart; replies go out through Photon's REST API. Both run in
+  Python from the `photon` extra, with no Node sidecar.
 
   The plugin ships with a `hermes photon setup` CLI that connects a Photon 2.0
   project: device login, project, project API key and a shared iMessage line.
@@ -35,22 +33,6 @@ optional_env:
     description: "Photon Spectrum project secret (before Photon 2.0); `hermes photon setup` moves it into auth.json"
     prompt: "Photon Spectrum project secret"
     password: true
-  - name: PHOTON_SIDECAR_PORT
-    description: "Loopback port for the Node sidecar control + inbound channel (default 8789)"
-    prompt: "Sidecar control port"
-    password: false
-  - name: PHOTON_SIDECAR_TOKEN
-    description: "Shared secret for the loopback sidecar channel (default: random per start)"
-    prompt: "Sidecar token"
-    password: true
-  - name: PHOTON_SIDECAR_AUTOSTART
-    description: "Spawn the Node sidecar on connect (true/false, default true)"
-    prompt: "Auto-start the sidecar?"
-    password: false
-  - name: PHOTON_NODE_BIN
-    description: "Path to the node binary (default: PM's pinned node, then PATH)"
-    prompt: "Node executable path"
-    password: false
   - name: PHOTON_API_HOST
     description: "Photon API host (default https://api.photon.codes)"
     prompt: "Photon API host"
@@ -76,22 +58,14 @@ optional_env:
     prompt: "Group mention patterns"
     password: false
   - name: PHOTON_HOME_CHANNEL
-    description: "Default Photon target for cron / notification delivery: Spectrum space id, DM GUID, or bare E.164 phone number"
+    description: "Default Photon target for cron / notification delivery: a Photon space id (pho_spc_...) or the E.164 phone number of someone who has texted your line"
     prompt: "Home Photon target"
     password: false
   - name: PHOTON_HOME_CHANNEL_NAME
     description: "Human label for the home channel"
     prompt: "Home channel display name"
     password: false
-  - name: PHOTON_TELEMETRY
-    description: "Enable Spectrum SDK telemetry in the sidecar (true/false, default false; toggle with `hermes photon telemetry on|off`)"
-    prompt: "Enable Spectrum telemetry? (true/false)"
-    password: false
   - name: PHOTON_MARKDOWN
-    description: "Send agent replies as markdown — iMessage renders it natively, other Spectrum platforms degrade to plain text (true/false, default true)"
+    description: "Send agent replies as markdown, falling back to plain text when Photon refuses it (true/false, default true)"
     prompt: "Render replies as markdown? (true/false)"
-    password: false
-  - name: PHOTON_REACTIONS
-    description: "Tapback 👀/👍/👎 on messages as processing status and route tapbacks on bot messages to the agent (true/false, default false)"
-    prompt: "Enable reaction tapbacks? (true/false)"
     password: false
